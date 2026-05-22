@@ -76,6 +76,16 @@
   ignore_errors: true
 
 # ──────────────────────────────────────────────
+#  Passwordless sudo for the lab user
+# ──────────────────────────────────────────────
+- name: Grant passwordless sudo to lab user
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ libvirt_user }}-nopasswd"
+    content: "{{ libvirt_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    mode: "0440"
+    validate: "visudo -cf %s"
+
+# ──────────────────────────────────────────────
 #  Add current user to libvirt and kvm groups
 # ──────────────────────────────────────────────
 - name: Add user to libvirt group
