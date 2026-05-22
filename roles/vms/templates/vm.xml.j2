@@ -1,0 +1,92 @@
+<domain type='kvm'>
+  <name>{{ vm.name }}</name>
+  <memory unit='MiB'>{{ vm.ram_mb }}</memory>
+  <currentMemory unit='MiB'>{{ vm.ram_mb }}</currentMemory>
+  <vcpu placement='static'>{{ vm.vcpus }}</vcpu>
+
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='secure-boot'/>
+    </firmware>
+    <bootmenu enable='yes' timeout='3000'/>
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+
+  <cpu mode='host-passthrough' check='none' migratable='on'>
+    <topology sockets='1' dies='1' cores='{{ vm.vcpus }}' threads='1'/>
+  </cpu>
+
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <devices>
+    <!-- Primary boot disk -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap' cache='none' io='native'/>
+      <source file='{{ libvirt_storage_pool_path }}/{{ vm.name }}.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+      <boot order='2'/>
+    </disk>
+
+    <!-- Agent ISO — boot order 1; remove after install -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{{ ocp_install_dir }}/agent.x86_64.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+      <boot order='1'/>
+    </disk>
+
+    <!-- NIC on OCP lab network -->
+    <interface type='network'>
+      <mac address='{{ vm.mac }}'/>
+      <source network='{{ ocp_network_name }}'/>
+      <model type='virtio'/>
+    </interface>
+
+    <!-- Serial console (for debugging) -->
+    <serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+
+    <!-- VirtIO graphics for virt-viewer -->
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+    </video>
+
+    <!-- Hardware RNG -->
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+
+    <!-- Watchdog for crash recovery -->
+    <watchdog model='i6300esb' action='reset'/>
+
+    <memballoon model='virtio'/>
+  </devices>
+
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+</domain>

@@ -1,0 +1,129 @@
+---
+# ──────────────────────────────────────────────
+#  Fedora 42 uses modular libvirt daemons
+#  (virtqemud, virtnetworkd, virtstoraged, etc.)
+#  rather than a monolithic libvirtd.
+# ──────────────────────────────────────────────
+
+- name: Enable and start virtqemud socket
+  ansible.builtin.systemd:
+    name: virtqemud.socket
+    enabled: true
+    state: started
+
+- name: Enable and start virtnetworkd socket
+  ansible.builtin.systemd:
+    name: virtnetworkd.socket
+    enabled: true
+    state: started
+
+- name: Enable and start virtstoraged socket
+  ansible.builtin.systemd:
+    name: virtstoraged.socket
+    enabled: true
+    state: started
+
+- name: Enable and start virtnodedevd socket
+  ansible.builtin.systemd:
+    name: virtnodedevd.socket
+    enabled: true
+    state: started
+
+- name: Enable and start virtsecretd socket
+  ansible.builtin.systemd:
+    name: virtsecretd.socket
+    enabled: true
+    state: started
+
+- name: Enable virtlogd socket
+  ansible.builtin.systemd:
+    name: virtlogd.socket
+    enabled: true
+    state: started
+
+# ──────────────────────────────────────────────
+#  /etc/libvirt/qemu.conf tweaks
+# ──────────────────────────────────────────────
+- name: Configure QEMU security driver (permissive for lab)
+  ansible.builtin.lineinfile:
+    path: /etc/libvirt/qemu.conf
+    regexp: '^#?\s*security_driver\s*='
+    line: 'security_driver = "none"'
+    backup: true
+
+- name: Configure QEMU user
+  ansible.builtin.lineinfile:
+    path: /etc/libvirt/qemu.conf
+    regexp: '^#?\s*user\s*='
+    line: 'user = "root"'
+
+- name: Configure QEMU group
+  ansible.builtin.lineinfile:
+    path: /etc/libvirt/qemu.conf
+    regexp: '^#?\s*group\s*='
+    line: 'group = "kvm"'
+
+- name: Enable dynamic ownership of disk images
+  ansible.builtin.lineinfile:
+    path: /etc/libvirt/qemu.conf
+    regexp: '^#?\s*dynamic_ownership\s*='
+    line: 'dynamic_ownership = 1'
+
+- name: Restart virtqemud to apply qemu.conf changes
+  ansible.builtin.systemd:
+    name: virtqemud
+    state: restarted
+  ignore_errors: true
+
+# ──────────────────────────────────────────────
+#  Add current user to libvirt and kvm groups
+# ──────────────────────────────────────────────
+- name: Add user to libvirt group
+  ansible.builtin.user:
+    name: "{{ libvirt_user }}"
+    groups: libvirt
+    append: true
+
+- name: Add user to kvm group
+  ansible.builtin.user:
+    name: "{{ libvirt_user }}"
+    groups: kvm
+    append: true
+
+# ──────────────────────────────────────────────
+#  Kernel modules and IP forwarding
+# ──────────────────────────────────────────────
+- name: Load kvm_intel module with nested virtualisation
+  ansible.builtin.command: modprobe kvm_intel nested=1
+  ignore_errors: true
+  changed_when: true
+
+- name: Ensure kvm_intel loads at boot with nested virtualisation
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/kvm-nested.conf
+    content: "options kvm_intel nested=1\n"
+    mode: "0644"
+
+- name: Enable IP forwarding at runtime
+  ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+  changed_when: true
+
+- name: Persist IP forwarding
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-kvm-ip-forward.conf
+    content: "net.ipv4.ip_forward = 1\n"
+    mode: "0644"
+
+# ──────────────────────────────────────────────
+#  Firewall: allow libvirt traffic
+# ──────────────────────────────────────────────
+- name: Allow libvirt zone traffic (firewalld)
+  ansible.builtin.command: >
+    firewall-cmd --zone=libvirt --set-target=ACCEPT --permanent
+  ignore_errors: true
+  changed_when: true
+
+- name: Reload firewalld
+  ansible.builtin.command: firewall-cmd --reload
+  ignore_errors: true
+  changed_when: true

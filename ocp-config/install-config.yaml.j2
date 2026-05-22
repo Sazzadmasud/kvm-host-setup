@@ -1,0 +1,29 @@
+apiVersion: v1
+baseDomain: {{ base_domain }}
+metadata:
+  name: {{ cluster_name }}
+
+networking:
+  networkType: OVNKubernetes
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+  machineNetwork:
+    - cidr: {{ ocp_network_cidr }}
+  serviceNetwork:
+    - 172.30.0.0/16
+
+compute:
+  - name: worker
+    replicas: {{ worker_nodes | length }}
+
+controlPlane:
+  name: master
+  replicas: {{ control_nodes | length }}
+  hyperthreading: Enabled
+
+platform:
+  none: {}
+
+pullSecret: '{{ pull_secret }}'
+sshKey: '{{ ssh_pub_key }}'

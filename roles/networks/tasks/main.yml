@@ -1,0 +1,77 @@
+---
+# ──────────────────────────────────────────────
+#  Define the OCP lab network
+# ──────────────────────────────────────────────
+- name: Render labnet XML
+  ansible.builtin.template:
+    src: labnet.xml.j2
+    dest: /tmp/labnet.xml
+    mode: "0644"
+
+- name: Check if labnet is already defined
+  ansible.builtin.command: "virsh net-info {{ ocp_network_name }}"
+  register: net_info
+  changed_when: false
+  ignore_errors: true
+
+- name: Define labnet
+  ansible.builtin.command: "virsh net-define /tmp/labnet.xml"
+  when: net_info.rc != 0
+  changed_when: true
+
+- name: Autostart labnet
+  ansible.builtin.command: "virsh net-autostart {{ ocp_network_name }}"
+  changed_when: true
+
+- name: Start labnet
+  ansible.builtin.command: "virsh net-start {{ ocp_network_name }}"
+  register: net_start
+  changed_when: net_start.rc == 0
+  failed_when: net_start.rc != 0 and 'already active' not in net_start.stderr
+
+# ──────────────────────────────────────────────
+#  Host DNS: teach NetworkManager to resolve
+#  *.cluster.base_domain via libvirt dnsmasq
+# ──────────────────────────────────────────────
+- name: Configure NetworkManager to forward OCP domain to libvirt dnsmasq
+  ansible.builtin.copy:
+    dest: "/etc/NetworkManager/conf.d/ocp-{{ cluster_name }}.conf"
+    content: |
+      [main]
+      dns=dnsmasq
+    mode: "0644"
+
+- name: Write dnsmasq stub zone for OCP cluster
+  ansible.builtin.copy:
+    dest: "/etc/NetworkManager/dnsmasq.d/ocp-{{ cluster_name }}.conf"
+    content: |
+      server=/{{ cluster_name }}.{{ base_domain }}/{{ ocp_network_gateway }}
+      address=/apps.{{ cluster_name }}.{{ base_domain }}/{{ ingress_vip }}
+    mode: "0644"
+
+- name: Reload NetworkManager to apply DNS config
+  ansible.builtin.systemd:
+    name: NetworkManager
+    state: reloaded
+
+# ──────────────────────────────────────────────
+#  /etc/hosts fallback entries
+# ──────────────────────────────────────────────
+- name: Add API VIP to /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "api\\.{{ cluster_name }}\\.{{ base_domain }}"
+    line: "{{ api_vip }} api.{{ cluster_name }}.{{ base_domain }}"
+
+- name: Add Ingress VIP to /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "apps\\.{{ cluster_name }}\\.{{ base_domain }}"
+    line: "{{ ingress_vip }} oauth-openshift.apps.{{ cluster_name }}.{{ base_domain }} console-openshift-console.apps.{{ cluster_name }}.{{ base_domain }}"
+
+- name: Add cluster node entries to /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "{{ item.name }}\\.{{ cluster_name }}\\.{{ base_domain }}"
+    line: "{{ item.ip }} {{ item.name }}.{{ cluster_name }}.{{ base_domain }}"
+  loop: "{{ control_nodes + worker_nodes }}"

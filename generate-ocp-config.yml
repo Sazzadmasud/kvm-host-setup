@@ -1,0 +1,107 @@
+---
+# Generates install-config.yaml and agent-config.yaml, then runs
+# openshift-install agent create image to produce agent.x86_64.iso.
+#
+# Prerequisites:
+#   - openshift-install must be installed (run site.yml first)
+#   - Pull secret must exist at {{ ocp_base_dir }}/pull-secret.json
+#   - SSH public key must exist at ~/.ssh/id_rsa.pub (or override ssh_public_key_file)
+#
+# Usage:
+#   ansible-playbook generate-ocp-config.yml
+#   ansible-playbook generate-ocp-config.yml -e "cluster_name=mycluster base_domain=example.com"
+
+- name: Generate OCP agent-based install configuration
+  hosts: kvm_hosts
+  gather_facts: true
+
+  vars:
+    ssh_public_key_file: "~/.ssh/id_rsa.pub"
+    pull_secret_file: "{{ ocp_base_dir }}/pull-secret.json"
+
+  pre_tasks:
+    - name: Check pull secret exists
+      ansible.builtin.stat:
+        path: "{{ pull_secret_file }}"
+      register: ps_stat
+
+    - name: Fail if pull secret is missing
+      ansible.builtin.fail:
+        msg: "Pull secret not found at {{ pull_secret_file }}. Download it from console.redhat.com/openshift/install/pull-secret."
+      when: not ps_stat.stat.exists
+
+    - name: Read pull secret
+      ansible.builtin.slurp:
+        src: "{{ pull_secret_file }}"
+      register: pull_secret_raw
+
+    - name: Check SSH public key exists
+      ansible.builtin.stat:
+        path: "{{ ssh_public_key_file | expanduser }}"
+      register: ssh_key_stat
+
+    - name: Generate SSH key pair if missing
+      ansible.builtin.command: "ssh-keygen -t rsa -b 4096 -N '' -f {{ ssh_public_key_file | expanduser | regex_replace('\\.pub$', '') }}"
+      when: not ssh_key_stat.stat.exists
+      changed_when: true
+
+    - name: Read SSH public key
+      ansible.builtin.slurp:
+        src: "{{ ssh_public_key_file | expanduser }}"
+      register: ssh_pub_key_raw
+
+    - name: Set helper facts
+      ansible.builtin.set_fact:
+        pull_secret: "{{ pull_secret_raw.content | b64decode | trim }}"
+        ssh_pub_key: "{{ ssh_pub_key_raw.content | b64decode | trim }}"
+
+  tasks:
+    - name: Create install directory
+      ansible.builtin.file:
+        path: "{{ ocp_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render install-config.yaml
+      ansible.builtin.template:
+        src: ocp-config/install-config.yaml.j2
+        dest: "{{ ocp_install_dir }}/install-config.yaml"
+        mode: "0600"
+
+    - name: Render agent-config.yaml
+      ansible.builtin.template:
+        src: ocp-config/agent-config.yaml.j2
+        dest: "{{ ocp_install_dir }}/agent-config.yaml"
+        mode: "0600"
+
+    - name: Show rendered install-config.yaml (sanitized)
+      ansible.builtin.command: "grep -v pullSecret {{ ocp_install_dir }}/install-config.yaml"
+      register: ic_out
+      changed_when: false
+
+    - name: Display install-config.yaml
+      ansible.builtin.debug:
+        msg: "{{ ic_out.stdout_lines }}"
+
+    - name: Generate agent ISO (this takes ~2-3 minutes)
+      ansible.builtin.command: >
+        openshift-install agent create image
+        --dir {{ ocp_install_dir }}
+        --log-level info
+      register: iso_create
+      changed_when: true
+
+    - name: Verify ISO was created
+      ansible.builtin.stat:
+        path: "{{ ocp_install_dir }}/agent.x86_64.iso"
+      register: iso_stat
+
+    - name: Show ISO path
+      ansible.builtin.debug:
+        msg:
+          - "Agent ISO created: {{ ocp_install_dir }}/agent.x86_64.iso"
+          - "ISO size: {{ (iso_stat.stat.size / 1024 / 1024) | round(1) }} MB"
+          - ""
+          - "Next step: ansible-playbook site.yml --tags vms"
+          - "Then monitor: openshift-install --dir={{ ocp_install_dir }} agent wait-for bootstrap-complete"
+      when: iso_stat.stat.exists

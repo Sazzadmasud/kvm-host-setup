@@ -1,0 +1,66 @@
+apiVersion: v1alpha1
+kind: AgentConfig
+metadata:
+  name: {{ cluster_name }}
+
+rendezvousIP: {{ control_nodes[0].ip }}
+
+hosts:
+{% for node in control_nodes %}
+  - hostname: {{ node.name }}.{{ cluster_name }}.{{ base_domain }}
+    role: {{ node.role }}
+    interfaces:
+      - name: enp1s0
+        macAddress: {{ node.mac }}
+    networkConfig:
+      interfaces:
+        - name: enp1s0
+          type: ethernet
+          state: up
+          macAddress: {{ node.mac }}
+          ipv4:
+            enabled: true
+            address:
+              - ip: {{ node.ip }}
+                prefix-length: 24
+            dhcp: false
+      dns-resolver:
+        config:
+          server:
+            - {{ ocp_network_gateway }}
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: {{ ocp_network_gateway }}
+            next-hop-interface: enp1s0
+            table-id: 254
+{% endfor %}
+{% for node in worker_nodes %}
+  - hostname: {{ node.name }}.{{ cluster_name }}.{{ base_domain }}
+    role: {{ node.role }}
+    interfaces:
+      - name: enp1s0
+        macAddress: {{ node.mac }}
+    networkConfig:
+      interfaces:
+        - name: enp1s0
+          type: ethernet
+          state: up
+          macAddress: {{ node.mac }}
+          ipv4:
+            enabled: true
+            address:
+              - ip: {{ node.ip }}
+                prefix-length: 24
+            dhcp: false
+      dns-resolver:
+        config:
+          server:
+            - {{ ocp_network_gateway }}
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: {{ ocp_network_gateway }}
+            next-hop-interface: enp1s0
+            table-id: 254
+{% endfor %}

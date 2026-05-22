@@ -1,0 +1,44 @@
+---
+- name: Ensure storage pool directory exists
+  ansible.builtin.file:
+    path: "{{ libvirt_storage_pool_path }}"
+    state: directory
+    mode: "0711"
+    owner: root
+    group: root
+
+- name: Check if storage pool is already defined
+  ansible.builtin.command: "virsh pool-info {{ libvirt_storage_pool_name }}"
+  register: pool_info
+  changed_when: false
+  ignore_errors: true
+
+- name: Define storage pool
+  ansible.builtin.command: >
+    virsh pool-define-as
+    {{ libvirt_storage_pool_name }}
+    dir
+    --target {{ libvirt_storage_pool_path }}
+  when: pool_info.rc != 0
+  changed_when: true
+
+- name: Build storage pool (initialises metadata)
+  ansible.builtin.command: "virsh pool-build {{ libvirt_storage_pool_name }}"
+  when: pool_info.rc != 0
+  changed_when: true
+  ignore_errors: true
+
+- name: Autostart storage pool
+  ansible.builtin.command: "virsh pool-autostart {{ libvirt_storage_pool_name }}"
+  changed_when: true
+
+- name: Start storage pool
+  ansible.builtin.command: "virsh pool-start {{ libvirt_storage_pool_name }}"
+  register: pool_start
+  changed_when: pool_start.rc == 0
+  failed_when: pool_start.rc != 0 and 'already active' not in pool_start.stderr
+
+- name: Refresh storage pool
+  ansible.builtin.command: "virsh pool-refresh {{ libvirt_storage_pool_name }}"
+  changed_when: true
+  ignore_errors: true

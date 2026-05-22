@@ -1,0 +1,272 @@
+# KVM Host Setup for OCP 4.18 (Agent-based)
+
+Ansible playbooks to clean and configure a bare-metal KVM host, then deploy
+OpenShift Container Platform 4.18 using the agent-based installation method.
+
+---
+
+## Host Specifications
+
+| Property | Value |
+|---|---|
+| OS | Fedora Linux 42 (Workstation) |
+| Kernel | 6.19.8-100.fc42.x86_64 |
+| CPU | Intel Core i7-10710U — 6 cores / 12 threads, VT-x |
+| RAM | 62 GB (8 GB swap) |
+| Root disk | NVMe 29 GB (btrfs, `/` + `/home`) |
+| Data disk | `/dev/sda1` ext4 733 GB → `/opt` |
+| KVM stack | qemu-kvm 9.2.4, libvirt 11.0.0 (modular daemons) |
+| SELinux | permissive (config: enforcing) |
+
+---
+
+## Cluster Design
+
+### Topology: 3 control plane + 2 workers
+
+| Node | Role | vCPU | RAM | Disk | MAC | IP |
+|---|---|---|---|---|---|---|
+| ocp-control-1 | master | 4 | 16 GB | 120 GB | `52:54:00:c0:01:01` | 192.168.200.21 |
+| ocp-control-2 | master | 4 | 16 GB | 120 GB | `52:54:00:c0:01:02` | 192.168.200.22 |
+| ocp-control-3 | master | 4 | 16 GB | 120 GB | `52:54:00:c0:01:03` | 192.168.200.23 |
+| ocp-worker-1  | worker | 4 |  8 GB | 120 GB | `52:54:00:c0:02:01` | 192.168.200.31 |
+| ocp-worker-2  | worker | 4 |  8 GB | 120 GB | `52:54:00:c0:02:02` | 192.168.200.32 |
+
+### Network
+
+| Purpose | Value |
+|---|---|
+| Network name | `labnet` |
+| Bridge | `virbr4` |
+| Mode | NAT |
+| Subnet | 192.168.200.0/24 |
+| Gateway / DNS | 192.168.200.1 (libvirt dnsmasq) |
+| DHCP range | 192.168.200.100–200 |
+| API VIP | 192.168.200.10 |
+| Ingress VIP | 192.168.200.11 |
+| Cluster domain | `ocp.lab.local` |
+
+DNS is handled by libvirt's built-in dnsmasq on `virbr4`, with a NetworkManager
+stub zone forwarding `*.ocp.lab.local` to `192.168.200.1` on the host.
+
+---
+
+## Project Structure
+
+```
+kvm-host-setup/
+├── ansible.cfg                        # Inventory path, become, callbacks
+├── inventory/
+│   └── hosts.yml                      # Single host: localhost (local connection)
+├── group_vars/
+│   └── all.yml                        # All variables — edit this first
+│
+├── roles/
+│   ├── cleanup/tasks/main.yml         # Destroy VMs, networks, pools; wipe dirs
+│   ├── packages/tasks/main.yml        # dnf + openshift-install + oc downloads
+│   ├── libvirt_setup/tasks/main.yml   # Modular daemons, qemu.conf, groups, sysctl
+│   ├── networks/tasks/main.yml        # Define labnet + DNS/hosts config
+│   ├── storage_pool/tasks/main.yml    # /opt/images pool
+│   └── vms/tasks/main.yml            # Disk images + VM XML definitions
+│
+├── ocp-config/
+│   ├── install-config.yaml.j2         # OCP install-config template
+│   └── agent-config.yaml.j2          # Per-node NMState static IP config
+│
+├── site.yml                           # Full host setup playbook
+├── cleanup.yml                        # Wipe-only playbook (with confirmation)
+└── generate-ocp-config.yml           # Render configs + run openshift-install
+```
+
+---
+
+## Prerequisites
+
+1. **Fedora 42** with `qemu-kvm` and `libvirt` already installed
+   (`ansible-core` is installed by the `packages` role).
+2. **Pull secret** from [console.redhat.com](https://console.redhat.com/openshift/install/pull-secret).
+3. **SSH key pair** at `~/.ssh/id_rsa` (generated automatically if missing).
+4. `/opt` mounted on a large disk (≥ 500 GB free).
+
+---
+
+## Step-by-Step Deployment
+
+### 1 — Wipe the existing environment
+
+Destroys all running VMs, undefines networks and storage pools, wipes
+`/opt/images`, `/opt/ocp`, `/opt/ocp-build`, `/opt/ocp-lab`, cleans the dnf
+cache, vacuums the systemd journal, and prunes Docker.
+
+```bash
+cd /opt/kvm-host-setup
+ansible-playbook cleanup.yml
+```
+
+### 2 — Set up the KVM host
+
+Installs packages, configures libvirt modular daemons, defines the `labnet`
+network, creates the `/opt/images` storage pool, and creates VM disk images +
+XML definitions (VMs are **not** started yet — the agent ISO doesn't exist yet).
+
+```bash
+ansible-playbook site.yml
+```
+
+You can target individual roles with tags:
+
+```bash
+ansible-playbook site.yml --tags packages
+ansible-playbook site.yml --tags libvirt
+ansible-playbook site.yml --tags networks
+ansible-playbook site.yml --tags storage
+ansible-playbook site.yml --tags vms
+```
+
+### 3 — Add your pull secret
+
+```bash
+cp ~/pull-secret.json /opt/ocp/pull-secret.json
+chmod 600 /opt/ocp/pull-secret.json
+```
+
+### 4 — Generate the agent ISO
+
+Renders `install-config.yaml` and `agent-config.yaml` from templates, then
+calls `openshift-install agent create image` to produce `agent.x86_64.iso`.
+
+```bash
+ansible-playbook generate-ocp-config.yml
+```
+
+To override variables inline:
+
+```bash
+ansible-playbook generate-ocp-config.yml \
+  -e "cluster_name=mycluster base_domain=example.com"
+```
+
+### 5 — Start the VMs
+
+The `vms` role detects the ISO and boots all nodes.
+
+```bash
+ansible-playbook site.yml --tags vms
+```
+
+### 6 — Monitor installation
+
+```bash
+# Wait for bootstrap to complete (~15 min)
+openshift-install --dir=/opt/ocp/cluster agent wait-for bootstrap-complete \
+  --log-level=info
+
+# Wait for full install to complete (~45 min total)
+openshift-install --dir=/opt/ocp/cluster agent wait-for install-complete \
+  --log-level=info
+```
+
+### 7 — Access the cluster
+
+```bash
+export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
+oc get nodes
+oc get co   # cluster operators
+```
+
+Web console: `https://console-openshift-console.apps.ocp.lab.local`
+
+---
+
+## Customisation
+
+All tunable values live in [group_vars/all.yml](group_vars/all.yml):
+
+| Variable | Default | Description |
+|---|---|---|
+| `cluster_name` | `ocp` | OCP cluster name |
+| `base_domain` | `lab.local` | Base DNS domain |
+| `ocp_version` | `4.18` | Used for client downloads |
+| `api_vip` | `192.168.200.10` | API load-balancer VIP |
+| `ingress_vip` | `192.168.200.11` | Ingress/router VIP |
+| `ocp_network_cidr` | `192.168.200.0/24` | Machine network |
+| `control_vm_vcpus` | `4` | vCPUs per control node |
+| `control_vm_ram_mb` | `16384` | RAM per control node (MB) |
+| `control_vm_disk_gb` | `120` | Disk per control node (GB) |
+| `worker_vm_vcpus` | `4` | vCPUs per worker |
+| `worker_vm_ram_mb` | `8192` | RAM per worker (MB) |
+| `worker_vm_disk_gb` | `120` | Disk per worker (GB) |
+| `libvirt_storage_pool_path` | `/opt/images` | Where qcow2 images are stored |
+| `ocp_install_dir` | `/opt/ocp/cluster` | openshift-install working dir |
+
+---
+
+## Key Design Notes
+
+**Fedora 42 modular libvirt daemons** — Fedora 38+ replaced the monolithic
+`libvirtd` with split socket-activated daemons (`virtqemud`, `virtnetworkd`,
+`virtstoraged`, etc.). The `libvirt_setup` role enables the correct sockets.
+
+**UEFI / q35 VMs** — All VMs use the `q35` machine type with UEFI firmware
+(`--nvram` must be passed to `virsh undefine` to clean up NVRAM state, which
+the cleanup role does).
+
+**Agent-based install** — A single `agent.x86_64.iso` is attached to all
+nodes as a CD-ROM (boot order 1). The first node to boot becomes the
+rendezvous host. After install completes the nodes reboot from their vda disk
+(boot order 2).
+
+**Static IPs via DHCP reservation** — Each VM is assigned a deterministic
+MAC address. The libvirt network's dnsmasq binds that MAC to a fixed IP, so
+the NMState config in `agent-config.yaml` and the DHCP lease always agree.
+
+**No extra Ansible collections required** — Only `ansible.builtin.*` modules
+are used. `community.general` and `ansible.posix` are not installed on this
+host and are avoided.
+
+---
+
+## Troubleshooting
+
+### Check VM console
+
+```bash
+virsh console ocp-control-1
+# or
+virt-viewer ocp-control-1
+```
+
+### Check agent bootstrap logs (from any control node)
+
+```bash
+ssh core@192.168.200.21
+journalctl -u agent.service -f
+```
+
+### Root filesystem full
+
+The root NVMe (`/dev/nvme0n1p6`, 29 GB btrfs) was at 95% before cleanup.
+The `cleanup` role runs `dnf clean all`, `journalctl --vacuum-size=200M`, and
+`docker system prune -af --volumes` to reclaim space.
+
+If it fills again, check:
+
+```bash
+du -sh /var/lib/docker /var/lib/libvirt /var/log
+sudo btrfs filesystem usage /
+```
+
+Consider moving Docker's data root to `/opt`:
+
+```bash
+# /etc/docker/daemon.json
+{ "data-root": "/opt/docker" }
+```
+
+### libvirt network not starting
+
+```bash
+systemctl status virtnetworkd.socket
+virsh net-list --all
+virsh net-start labnet
+```

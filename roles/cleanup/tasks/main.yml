@@ -1,0 +1,115 @@
+---
+# ──────────────────────────────────────────────
+#  1. Destroy and undefine all VMs
+# ──────────────────────────────────────────────
+- name: Get list of all defined VMs
+  ansible.builtin.command: virsh list --all --name
+  register: all_vms
+  changed_when: false
+
+- name: Destroy running VMs
+  ansible.builtin.command: "virsh destroy {{ item }}"
+  loop: "{{ all_vms.stdout_lines | select('ne', '') | list }}"
+  ignore_errors: true
+  changed_when: true
+
+- name: Undefine VMs (remove NVRAM/firmware state)
+  ansible.builtin.command: "virsh undefine {{ item }} --nvram --remove-all-storage"
+  loop: "{{ all_vms.stdout_lines | select('ne', '') | list }}"
+  ignore_errors: true
+  changed_when: true
+
+# ──────────────────────────────────────────────
+#  2. Destroy and undefine all non-default networks
+# ──────────────────────────────────────────────
+- name: Get list of all defined networks
+  ansible.builtin.command: virsh net-list --all --name
+  register: all_networks
+  changed_when: false
+
+- name: Destroy active networks
+  ansible.builtin.command: "virsh net-destroy {{ item }}"
+  loop: "{{ all_networks.stdout_lines | select('ne', '') | reject('eq', 'default') | list }}"
+  ignore_errors: true
+  changed_when: true
+
+- name: Undefine networks
+  ansible.builtin.command: "virsh net-undefine {{ item }}"
+  loop: "{{ all_networks.stdout_lines | select('ne', '') | reject('eq', 'default') | list }}"
+  ignore_errors: true
+  changed_when: true
+
+# ──────────────────────────────────────────────
+#  3. Destroy and undefine all storage pools
+# ──────────────────────────────────────────────
+- name: Get list of all storage pools
+  ansible.builtin.command: virsh pool-list --all --name
+  register: all_pools
+  changed_when: false
+
+- name: Destroy active pools
+  ansible.builtin.command: "virsh pool-destroy {{ item }}"
+  loop: "{{ all_pools.stdout_lines | select('ne', '') | list }}"
+  ignore_errors: true
+  changed_when: true
+
+- name: Undefine storage pools
+  ansible.builtin.command: "virsh pool-undefine {{ item }}"
+  loop: "{{ all_pools.stdout_lines | select('ne', '') | list }}"
+  ignore_errors: true
+  changed_when: true
+
+# ──────────────────────────────────────────────
+#  4. Remove stale vnet interfaces
+# ──────────────────────────────────────────────
+- name: Find stale vnet interfaces
+  ansible.builtin.shell: "ip link show | grep -oP 'vnet[0-9]+' || true"
+  register: vnet_ifaces
+  changed_when: false
+
+- name: Delete stale vnet interfaces
+  ansible.builtin.command: "ip link delete {{ item }}"
+  loop: "{{ vnet_ifaces.stdout_lines | select('ne', '') | list }}"
+  ignore_errors: true
+  changed_when: true
+
+# ──────────────────────────────────────────────
+#  5. Wipe OCP/image directories on /opt
+# ──────────────────────────────────────────────
+- name: Remove OCP and image directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ cleanup_dirs }}"
+
+- name: Recreate empty directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ cleanup_dirs }}"
+
+# ──────────────────────────────────────────────
+#  6. Free root filesystem space
+# ──────────────────────────────────────────────
+- name: Clean dnf package cache
+  ansible.builtin.command: dnf clean all
+  changed_when: true
+
+- name: Vacuum systemd journal to 200MB
+  ansible.builtin.command: journalctl --vacuum-size=200M
+  changed_when: true
+
+- name: Remove unused Docker images, containers, and volumes
+  ansible.builtin.command: docker system prune -af --volumes
+  ignore_errors: true
+  changed_when: true
+
+- name: Report root filesystem usage after cleanup
+  ansible.builtin.command: df -h /
+  register: df_result
+  changed_when: false
+
+- name: Show disk usage
+  ansible.builtin.debug:
+    msg: "{{ df_result.stdout_lines }}"

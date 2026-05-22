@@ -1,0 +1,86 @@
+---
+# ──────────────────────────────────────────────
+#  OCP Cluster
+# ──────────────────────────────────────────────
+cluster_name: ocp
+base_domain: lab.local
+ocp_version: "4.18"
+
+# ──────────────────────────────────────────────
+#  Networking
+# ──────────────────────────────────────────────
+ocp_network_name: labnet
+ocp_network_bridge: virbr4
+ocp_network_gateway: 192.168.200.1
+ocp_network_cidr: 192.168.200.0/24
+ocp_network_netmask: 255.255.255.0
+ocp_network_dhcp_start: 192.168.200.100
+ocp_network_dhcp_end: 192.168.200.200
+
+# VIPs must be outside the DHCP range
+api_vip: 192.168.200.10
+ingress_vip: 192.168.200.11
+
+# ──────────────────────────────────────────────
+#  Storage
+# ──────────────────────────────────────────────
+libvirt_storage_pool_name: ocp-images
+libvirt_storage_pool_path: /opt/images
+
+ocp_base_dir: /opt/ocp
+ocp_install_dir: "{{ ocp_base_dir }}/cluster"
+
+# ──────────────────────────────────────────────
+#  VM Defaults
+# ──────────────────────────────────────────────
+# Host: i7-10710U, 12 threads, 62GB RAM
+# Control total: 3 × 16 GB = 48 GB (overcommit is fine for lab)
+# Worker total:  2 × 8  GB = 16 GB
+# Host reserve:  ~2-3 GB
+
+control_vm_vcpus: 4
+control_vm_ram_mb: 16384
+control_vm_disk_gb: 120
+
+worker_vm_vcpus: 4
+worker_vm_ram_mb: 8192
+worker_vm_disk_gb: 120
+
+# ──────────────────────────────────────────────
+#  Nodes  (static IPs + MAC addresses)
+# ──────────────────────────────────────────────
+control_nodes:
+  - name: ocp-control-1
+    mac: "52:54:00:c0:01:01"
+    ip: 192.168.200.21
+    role: master
+  - name: ocp-control-2
+    mac: "52:54:00:c0:01:02"
+    ip: 192.168.200.22
+    role: master
+  - name: ocp-control-3
+    mac: "52:54:00:c0:01:03"
+    ip: 192.168.200.23
+    role: master
+
+worker_nodes:
+  - name: ocp-worker-1
+    mac: "52:54:00:c0:02:01"
+    ip: 192.168.200.31
+    role: worker
+  - name: ocp-worker-2
+    mac: "52:54:00:c0:02:02"
+    ip: 192.168.200.32
+    role: worker
+
+# ──────────────────────────────────────────────
+#  Directories to wipe during full cleanup
+# ──────────────────────────────────────────────
+cleanup_dirs:
+  - /opt/images
+  - /opt/ocp
+  - /opt/ocp-build
+  - /opt/ocp-lab
+
+# libvirt user (will be added to libvirt group)
+libvirt_user: "{{ ansible_user_id }}"

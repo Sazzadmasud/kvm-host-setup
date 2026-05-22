@@ -1,0 +1,95 @@
+---
+- name: Reset VM list
+  ansible.builtin.set_fact:
+    all_vms: []
+
+- name: Accumulate control plane VMs
+  ansible.builtin.set_fact:
+    all_vms: >-
+      {{ all_vms + [item | combine({
+          'vcpus':   control_vm_vcpus,
+          'ram_mb':  control_vm_ram_mb,
+          'disk_gb': control_vm_disk_gb
+      })] }}
+  loop: "{{ control_nodes }}"
+
+- name: Accumulate worker VMs
+  ansible.builtin.set_fact:
+    all_vms: >-
+      {{ all_vms + [item | combine({
+          'vcpus':   worker_vm_vcpus,
+          'ram_mb':  worker_vm_ram_mb,
+          'disk_gb': worker_vm_disk_gb
+      })] }}
+  loop: "{{ worker_nodes }}"
+
+# ──────────────────────────────────────────────
+#  Create disk images
+# ──────────────────────────────────────────────
+- name: Create qcow2 disk images
+  ansible.builtin.command: >
+    qemu-img create -f qcow2
+    {{ libvirt_storage_pool_path }}/{{ item.name }}.qcow2
+    {{ item.disk_gb }}G
+  args:
+    creates: "{{ libvirt_storage_pool_path }}/{{ item.name }}.qcow2"
+  loop: "{{ all_vms }}"
+  changed_when: true
+
+- name: Set correct permissions on disk images
+  ansible.builtin.file:
+    path: "{{ libvirt_storage_pool_path }}/{{ item.name }}.qcow2"
+    mode: "0600"
+    owner: root
+    group: kvm
+  loop: "{{ all_vms }}"
+
+# ──────────────────────────────────────────────
+#  Define VMs from XML template
+# ──────────────────────────────────────────────
+- name: Render VM XML definitions
+  ansible.builtin.template:
+    src: vm.xml.j2
+    dest: "/tmp/{{ vm.name }}.xml"
+    mode: "0644"
+  loop: "{{ all_vms }}"
+  loop_control:
+    loop_var: vm
+
+- name: Check which VMs are already defined
+  ansible.builtin.command: "virsh dominfo {{ item.name }}"
+  register: dominfo_results
+  changed_when: false
+  ignore_errors: true
+  loop: "{{ all_vms }}"
+
+- name: Define VMs that are not yet defined
+  ansible.builtin.command: "virsh define /tmp/{{ item.item.name }}.xml"
+  when: item.rc != 0
+  loop: "{{ dominfo_results.results }}"
+  changed_when: true
+
+# ──────────────────────────────────────────────
+#  Start VMs (only if agent ISO exists)
+# ──────────────────────────────────────────────
+- name: Check if agent ISO exists
+  ansible.builtin.stat:
+    path: "{{ ocp_install_dir }}/agent.x86_64.iso"
+  register: agent_iso
+
+- name: Start all VMs (agent ISO present — beginning install)
+  ansible.builtin.command: "virsh start {{ item.name }}"
+  loop: "{{ all_vms }}"
+  when: agent_iso.stat.exists
+  register: vm_start
+  changed_when: vm_start.rc == 0
+  failed_when: vm_start.rc != 0 and 'already running' not in vm_start.stderr
+
+- name: Inform user when agent ISO is missing
+  ansible.builtin.debug:
+    msg: >
+      VMs are defined but NOT started — agent ISO not found at
+      {{ ocp_install_dir }}/agent.x86_64.iso.
+      Run the 'generate-ocp-config.yml' playbook first, then
+      'ansible-playbook site.yml --tags vms' to start them.
+  when: not agent_iso.stat.exists

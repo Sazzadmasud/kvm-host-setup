@@ -1,0 +1,115 @@
+---
+- name: Install KVM and virtualization packages
+  ansible.builtin.dnf:
+    name:
+      # KVM / QEMU
+      - qemu-kvm
+      - qemu-img
+      - libvirt
+      - libvirt-client
+      - libvirt-daemon-driver-qemu
+      - libvirt-daemon-driver-network
+      - libvirt-daemon-driver-storage-core
+      - libvirt-daemon-driver-storage-logical
+      - virt-install
+      - virt-viewer
+      # Python bindings (needed by Ansible libvirt modules)
+      - python3-libvirt
+      - python3-lxml
+      # Ansible
+      - ansible-core
+      # Networking tools
+      - dnsmasq
+      - bind-utils
+      - nmap
+      # Utilities
+      - git
+      - curl
+      - wget
+      - jq
+      - bash-completion
+      - tmux
+    state: present
+
+- name: Install HAProxy (load balancer for API/ingress VIPs)
+  ansible.builtin.dnf:
+    name: haproxy
+    state: present
+
+- name: Check if openshift-install is already present
+  ansible.builtin.stat:
+    path: /usr/local/bin/openshift-install
+  register: ocp_install_bin
+
+- name: Download openshift-install {{ ocp_version }}
+  when: not ocp_install_bin.stat.exists
+  block:
+    - name: Create temp download directory
+      ansible.builtin.tempfile:
+        state: directory
+      register: tmpdir
+
+    - name: Download openshift-install tarball
+      ansible.builtin.get_url:
+        url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-{{ ocp_version }}/openshift-install-linux.tar.gz"
+        dest: "{{ tmpdir.path }}/openshift-install-linux.tar.gz"
+        mode: "0644"
+
+    - name: Extract openshift-install
+      ansible.builtin.unarchive:
+        src: "{{ tmpdir.path }}/openshift-install-linux.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        include:
+          - openshift-install
+
+    - name: Set executable bit
+      ansible.builtin.file:
+        path: /usr/local/bin/openshift-install
+        mode: "0755"
+
+    - name: Cleanup temp directory
+      ansible.builtin.file:
+        path: "{{ tmpdir.path }}"
+        state: absent
+
+- name: Check if oc client is already present
+  ansible.builtin.stat:
+    path: /usr/local/bin/oc
+  register: oc_bin
+
+- name: Download oc client {{ ocp_version }}
+  when: not oc_bin.stat.exists
+  block:
+    - name: Create temp download directory
+      ansible.builtin.tempfile:
+        state: directory
+      register: tmpdir_oc
+
+    - name: Download oc tarball
+      ansible.builtin.get_url:
+        url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-{{ ocp_version }}/openshift-client-linux.tar.gz"
+        dest: "{{ tmpdir_oc.path }}/openshift-client-linux.tar.gz"
+        mode: "0644"
+
+    - name: Extract oc and kubectl
+      ansible.builtin.unarchive:
+        src: "{{ tmpdir_oc.path }}/openshift-client-linux.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        include:
+          - oc
+          - kubectl
+
+    - name: Set executable bits
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0755"
+      loop:
+        - /usr/local/bin/oc
+        - /usr/local/bin/kubectl
+
+    - name: Cleanup temp directory
+      ansible.builtin.file:
+        path: "{{ tmpdir_oc.path }}"
+        state: absent

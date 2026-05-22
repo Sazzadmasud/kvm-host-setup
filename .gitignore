@@ -1,0 +1,27 @@
+# OCP secrets — never commit these
+pull-secret.json
+**/pull-secret*
+**/auth/
+**/kubeconfig
+**/*.key
+**/*.pem
+**/*.crt
+install-config.yaml
+agent-config.yaml
+
+# Generated artifacts
+/opt/ocp/cluster/
+*.iso
+*.qcow2
+*.img
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.vscode/
+__pycache__/
+*.pyc
+
+# Ansible retry files
+*.retry

@@ -1,0 +1,65 @@
+---
+# Main playbook — full KVM host setup for OCP 4.18 (agent-based)
+#
+# Usage:
+#   ansible-playbook site.yml                  # full run
+#   ansible-playbook site.yml --tags packages  # only install packages
+#   ansible-playbook site.yml --tags networks  # only configure networks
+#   ansible-playbook site.yml --tags vms       # only create/start VMs
+
+- name: Setup KVM host for OCP
+  hosts: kvm_hosts
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify KVM virtualisation is available
+      ansible.builtin.command: "egrep -c '(vmx|svm)' /proc/cpuinfo"
+      register: kvm_check
+      changed_when: false
+      failed_when: kvm_check.stdout | int == 0
+
+    - name: Verify sufficient RAM (minimum 48 GB)
+      ansible.builtin.assert:
+        that: ansible_memtotal_mb >= 49152
+        msg: "Host has {{ ansible_memtotal_mb }} MB RAM; 48 GB minimum required for 3+2 OCP topology."
+
+    - name: Verify /opt has sufficient space (minimum 500 GB)
+      ansible.builtin.command: df --output=avail -BG /opt
+      register: opt_space
+      changed_when: false
+
+    - name: Assert /opt space
+      ansible.builtin.assert:
+        that: (opt_space.stdout_lines[1] | regex_replace('G','') | int) >= 500
+        msg: "/opt has insufficient free space."
+
+  roles:
+    - role: packages
+      tags: [packages]
+
+    - role: libvirt_setup
+      tags: [libvirt, libvirt_setup]
+
+    - role: networks
+      tags: [networks]
+
+    - role: storage_pool
+      tags: [storage, storage_pool]
+
+    - role: vms
+      tags: [vms]
+
+  post_tasks:
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "KVM host setup complete."
+          - "Network: {{ ocp_network_name }} ({{ ocp_network_cidr }}) via {{ ocp_network_bridge }}"
+          - "API VIP:     {{ api_vip }}  → api.{{ cluster_name }}.{{ base_domain }}"
+          - "Ingress VIP: {{ ingress_vip }} → *.apps.{{ cluster_name }}.{{ base_domain }}"
+          - ""
+          - "Next steps:"
+          - "  1. Copy your pull-secret to {{ ocp_base_dir }}/pull-secret.json"
+          - "  2. Run: ansible-playbook generate-ocp-config.yml"
+          - "  3. Run: ansible-playbook site.yml --tags vms  (starts VMs)"
+          - "  4. Monitor: openshift-install --dir={{ ocp_install_dir }} agent wait-for install-complete"

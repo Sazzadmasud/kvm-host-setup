@@ -1,0 +1,35 @@
+<network>
+  <name>{{ ocp_network_name }}</name>
+  <forward mode='nat'>
+    <nat>
+      <port start='1024' end='65535'/>
+    </nat>
+  </forward>
+  <bridge name='{{ ocp_network_bridge }}' stp='on' delay='0'/>
+  <dns>
+    <!-- API and Ingress VIP DNS entries -->
+    <host ip='{{ api_vip }}'>
+      <hostname>api.{{ cluster_name }}.{{ base_domain }}</hostname>
+    </host>
+    <host ip='{{ ingress_vip }}'>
+      <hostname>oauth-openshift.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
+      <hostname>console-openshift-console.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
+      <hostname>grafana-openshift-monitoring.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
+      <hostname>prometheus-k8s-openshift-monitoring.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
+      <hostname>alertmanager-main-openshift-monitoring.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
+    </host>
+    {% for node in control_nodes + worker_nodes %}
+    <host ip='{{ node.ip }}'>
+      <hostname>{{ node.name }}.{{ cluster_name }}.{{ base_domain }}</hostname>
+    </host>
+    {% endfor %}
+  </dns>
+  <ip address='{{ ocp_network_gateway }}' netmask='{{ ocp_network_netmask }}'>
+    <dhcp>
+      <range start='{{ ocp_network_dhcp_start }}' end='{{ ocp_network_dhcp_end }}'/>
+      {% for node in control_nodes + worker_nodes %}
+      <host mac='{{ node.mac }}' name='{{ node.name }}' ip='{{ node.ip }}'/>
+      {% endfor %}
+    </dhcp>
+  </ip>
+</network>
