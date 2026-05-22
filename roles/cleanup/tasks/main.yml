@@ -79,19 +79,10 @@
   ignore_errors: true
   changed_when: true
 
-- name: Remove all stale libvirt network runtime state
-  ansible.builtin.file:
-    path: /var/run/libvirt/network
-    state: absent
+- name: Remove all stale libvirt network runtime state (files and dirs)
+  ansible.builtin.shell: "rm -rf /var/run/libvirt/network/*"
   ignore_errors: true
-
-- name: Recreate empty libvirt network runtime dir
-  ansible.builtin.file:
-    path: /var/run/libvirt/network
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
+  changed_when: true
 
 - name: Remove stale dnsmasq virbr status files
   ansible.builtin.shell: "rm -f /var/lib/libvirt/dnsmasq/virbr*.status"

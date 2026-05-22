@@ -371,11 +371,8 @@ sudo kill $(cat /var/run/libvirt/network/br_labnet.pid) 2>/dev/null
 sudo kill $(cat /var/run/libvirt/network/provisioning.pid) 2>/dev/null
 
 # Remove all stale runtime state
-sudo rm -f /var/run/libvirt/network/br_labnet.pid \
-           /var/run/libvirt/network/provisioning.pid \
-           /var/run/libvirt/network/br_labnet \
-           /var/run/libvirt/network/autostarted \
-           /var/lib/libvirt/dnsmasq/virbr*.status
+sudo rm -rf /var/run/libvirt/network/* \
+            /var/lib/libvirt/dnsmasq/virbr*.status
 
 # Retry
 ansible-playbook site.yml --tags networks
