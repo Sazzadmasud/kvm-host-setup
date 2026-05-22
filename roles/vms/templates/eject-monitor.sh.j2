@@ -1,0 +1,87 @@
+#!/bin/bash
+# Watches all OCP VMs for RHCOS image-write completion and ejects the
+# agent ISO from each node before it can reboot back into the installer.
+#
+# Detection (first signal wins per node):
+#   1. virsh domain state goes to shut-off  (post-write reboot)
+#   2. install log shows Writing image.*100 or Rebooting for the node
+
+# --- Jinja2-rendered variables ---
+LOG="{{ ocp_install_dir }}/.openshift_install.log"
+all_vms=({{ all_vm_names | join(' ') }})
+timeout={{ eject_timeout_minutes * 60 }}
+# ---------------------------------
+
+{% raw %}
+COORD_DIR="/tmp/ocp_eject_coord"
+mkdir -p "$COORD_DIR"
+trap 'rm -rf "$COORD_DIR"' EXIT
+
+elapsed=0
+
+eject_vm() {
+    local vm=$1 live=$2
+    local flags="--eject --config"
+    [[ "$live" == yes ]] && flags="--eject --live --config"
+    if virsh -c qemu:///system change-media "$vm" sda $flags 2>/dev/null; then
+        echo "[$(date +%T)] $vm: ISO ejected (live=$live)"
+    else
+        echo "[$(date +%T)] $vm: eject returned non-zero (may already be ejected)"
+    fi
+    touch "$COORD_DIR/$vm"
+}
+
+remaining_count() {
+    local n=0
+    for vm in "${all_vms[@]}"; do
+        [[ -f "$COORD_DIR/$vm" ]] || n=$((n + 1))
+    done
+    echo "$n"
+}
+
+total=${#all_vms[@]}
+echo "Monitoring $total node(s) for RHCOS image-write completion..."
+
+while [[ $elapsed -lt $timeout ]]; do
+    for vm in "${all_vms[@]}"; do
+        [[ -f "$COORD_DIR/$vm" ]] && continue
+
+        state=$(virsh -c qemu:///system domstate "$vm" 2>/dev/null | tr -d ' \n')
+
+        case "$state" in
+            shutoff|inshutdown)
+                echo "[$(date +%T)] $vm is $state — post-write reboot detected"
+                eject_vm "$vm" no
+                ;;
+            running)
+                if grep -qiE \
+                    "Host[[:space:]]+${vm}[^:]*:[[:space:]]*(Writing image[^)]*100|Rebooting)" \
+                    "$LOG" 2>/dev/null; then
+                    echo "[$(date +%T)] $vm: image-write complete (log signal)"
+                    eject_vm "$vm" yes
+                fi
+                ;;
+            paused|suspended)
+                echo "[$(date +%T)] $vm: unexpected state $state, skipping this cycle"
+                ;;
+        esac
+    done
+
+    if [[ $(remaining_count) -eq 0 ]]; then
+        echo "All ISOs ejected successfully."
+        exit 0
+    fi
+
+    sleep 5
+    elapsed=$((elapsed + 5))
+done
+
+echo "WARNING: monitor timed out after ${timeout}s — force-ejecting remaining nodes."
+for vm in "${all_vms[@]}"; do
+    [[ -f "$COORD_DIR/$vm" ]] && continue
+    state=$(virsh -c qemu:///system domstate "$vm" 2>/dev/null | tr -d ' \n')
+    [[ "$state" == "running" ]] && live=yes || live=no
+    eject_vm "$vm" "$live"
+done
+echo "Force-eject complete."
+{% endraw %}

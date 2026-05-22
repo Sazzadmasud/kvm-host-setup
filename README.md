@@ -155,44 +155,49 @@ The `vms` role detects the ISO and boots all nodes.
 ansible-playbook site.yml --tags vms
 ```
 
-### 6 — Eject the agent ISO (as soon as image write completes)
+### 6 — Eject ISO and wait for bootstrap-complete
 
-Eject the ISO **as soon as the installer logs `Writing image to disk: 100%`**
-for each node — do not wait for bootstrap-complete. UEFI NVRAM does not
-reliably override the XML boot order on KVM; leaving the ISO attached causes
-nodes to reboot back into the installer instead of the disk, stalling the
-install with:
+Run this immediately after starting the VMs. It does three things
+automatically:
+
+1. Starts `openshift-install agent wait-for bootstrap-complete` in the
+   background (so the install log is live).
+2. Watches each node for RHCOS image-write completion — via two parallel
+   signals: the install log (`Writing image.*100` / `Rebooting`) and the
+   virsh domain state (`shut off` = node just rebooted after write).
+3. Ejects the ISO from each node the moment its disk write is done, before
+   the post-write reboot can boot back into the installer.
+
+UEFI NVRAM on KVM does not reliably honour the XML boot-order override;
+leaving the ISO attached causes nodes to reboot back into the installer
+instead of the disk, stalling the install with:
 
 ```
 Expected the host to boot from disk, but it booted the installation image
 ```
 
-Eject all nodes at once (safe to run even while nodes are up):
-
 ```bash
 ansible-playbook eject-iso.yml
 ```
 
-If a node already booted back into the ISO, eject and reboot it:
+The playbook exits once bootstrap-complete is reached (~15–20 min). If a
+node somehow boots back into the ISO before the playbook catches it, eject
+and reboot manually:
 
 ```bash
 sudo virsh -c qemu:///system change-media <vm> sda --eject --live --config
 sudo virsh -c qemu:///system reboot <vm>
 ```
 
-### 8 — Monitor installation
+### 7 — Wait for full install to complete
 
 ```bash
-# Wait for bootstrap to complete (~15 min)
-openshift-install --dir=/opt/ocp/cluster agent wait-for bootstrap-complete \
-  --log-level=info
-
-# Wait for full install to complete (~45 min total)
+# (~45 min total from VM start)
 openshift-install --dir=/opt/ocp/cluster agent wait-for install-complete \
   --log-level=info
 ```
 
-### 9 — Access the cluster
+### 8 — Access the cluster
 
 ```bash
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
@@ -745,6 +750,53 @@ Consider moving Docker's data root to `/opt`:
 # /etc/docker/daemon.json
 { "data-root": "/opt/docker" }
 ```
+
+### [T11] Bootstrap-complete timeout — only one node joined, kube-apiserver never deployed
+
+**Symptom** — `openshift-install agent wait-for bootstrap-complete` times out
+with `context deadline exceeded`. Only one control node appears in
+`oc get nodes`. The `kube-apiserver` and `kube-controller-manager` cluster
+operators show `StaticPodsAvailable: 0 nodes are active`, and the second and
+third control nodes cannot be reached via SSH (Permission denied —
+`authorized_keys` was never written).
+
+**Root cause (cascade)** — `api-int.ocp.lab.local` was missing from the live
+libvirt DNS at the moment nodes first booted. RHCOS first-boot ignition reads
+`/dev/sda3/ignition/config.ign`, which contains the MCS URL
+`https://api-int.ocp.lab.local:22623/config/master`. Without DNS, the ignition
+fetch fails silently and RHCOS boots with no SSH keys, no kubelet, and no
+cluster membership. This leaves the cluster with a single node, which triggers
+an MCO scheduling deadlock (the only node gets cordoned for config application,
+blocking the MCO controller from scheduling its own pods), which prevents
+`kube-apiserver` static pods from being deployed, which prevents
+bootstrap-complete.
+
+**Critical caveat** — Fixing the DNS on the live network *after* the nodes have
+already booted does **not** recover them. Ignition runs once, in the initramfs,
+on first boot. There is no automatic retry once the system is up. The only
+recovery is to reinstall the affected nodes (or start from scratch).
+
+**Prevention** — The `labnet.xml.j2` template includes both
+`api.ocp.lab.local` and `api-int.ocp.lab.local` on `api_vip` so a fresh
+`site.yml` run sets it correctly before any VM boots. Never start VMs before
+verifying:
+
+```bash
+dig api-int.ocp.lab.local @192.168.200.1 +short   # must return api_vip
+```
+
+**Recovery when DNS was wrong for a live install** — Wipe and reinstall:
+
+```bash
+ansible-playbook cleanup.yml
+ansible-playbook site.yml
+cp ~/pull-secret.json /opt/ocp/pull-secret.json && chmod 600 /opt/ocp/pull-secret.json
+ansible-playbook generate-ocp-config.yml
+ansible-playbook site.yml --tags vms
+ansible-playbook eject-iso.yml    # monitors + ejects + waits for bootstrap-complete
+```
+
+---
 
 ### libvirt network not starting
 
