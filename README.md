@@ -378,10 +378,20 @@ sudo rm -rf /var/run/libvirt/network/* \
 ansible-playbook site.yml --tags networks
 ```
 
-**Fix in the cleanup role** — The `cleanup` role now automatically finds and
-kills all PID files under `/var/run/libvirt/network/` and wipes the stale
-virbr status files before attempting any virsh operations, so this should not
-recur on subsequent full runs.
+**If the error persists after clearing PID files** — NetworkManager may be
+grabbing port 53 on the bridge IP the instant libvirt creates `virbr4`. Fix
+by marking libvirt interfaces as unmanaged in NM and reloading its config:
+
+```bash
+sudo tee /etc/NetworkManager/conf.d/99-libvirt.conf <<'EOF'
+[keyfile]
+unmanaged-devices=interface-name:virbr*;interface-name:vnet*
+EOF
+sudo nmcli general reload conf
+ansible-playbook site.yml --tags networks
+```
+
+The `libvirt_setup` role now writes this file automatically on every run.
 
 ---
 

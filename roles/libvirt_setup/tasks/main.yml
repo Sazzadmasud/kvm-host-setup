@@ -115,6 +115,23 @@
     mode: "0644"
 
 # ──────────────────────────────────────────────
+#  NetworkManager: keep NM away from libvirt interfaces
+#  Without this, NM grabs port 53 on virbr* the instant libvirt
+#  creates the bridge, causing dnsmasq "Address already in use".
+# ──────────────────────────────────────────────
+- name: Configure NM to leave libvirt bridge and tap interfaces unmanaged
+  ansible.builtin.copy:
+    dest: /etc/NetworkManager/conf.d/99-libvirt.conf
+    content: |
+      [keyfile]
+      unmanaged-devices=interface-name:virbr*;interface-name:vnet*
+    mode: "0644"
+
+- name: Reload NetworkManager config (non-disruptive)
+  ansible.builtin.command: nmcli general reload conf
+  changed_when: true
+
+# ──────────────────────────────────────────────
 #  Firewall: allow libvirt traffic
 # ──────────────────────────────────────────────
 - name: Allow libvirt zone traffic (firewalld)
