@@ -44,6 +44,7 @@
       ansible.builtin.command: "ssh-keygen -t rsa -b 4096 -N '' -f {{ ssh_public_key_file | expanduser | regex_replace('\\.pub$', '') }}"
       when: not ssh_key_stat.stat.exists
       changed_when: true
+      become: false
 
     - name: Read SSH public key
       ansible.builtin.slurp:
