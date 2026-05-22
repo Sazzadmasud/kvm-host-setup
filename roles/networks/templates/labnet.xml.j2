@@ -10,6 +10,7 @@
     <!-- API and Ingress VIP DNS entries -->
     <host ip='{{ api_vip }}'>
       <hostname>api.{{ cluster_name }}.{{ base_domain }}</hostname>
+      <hostname>api-int.{{ cluster_name }}.{{ base_domain }}</hostname>
     </host>
     <host ip='{{ ingress_vip }}'>
       <hostname>oauth-openshift.apps.{{ cluster_name }}.{{ base_domain }}</hostname>

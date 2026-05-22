@@ -544,6 +544,47 @@ ansible-playbook generate-ocp-config.yml
 
 ---
 
+### [T8] `Error while evaluating DNS resolution on this host` during bootstrap
+
+**Symptom** — After VMs boot and agents connect, DNS validation warnings appear
+for all hosts and never clear:
+
+```
+WARNING Host ocp-control-1.ocp.lab.local validation: Error while evaluating DNS resolution on this host
+```
+
+NTP and majority-connectivity warnings that appear alongside this are **transient** —
+they self-resolve within a few minutes as all nodes finish booting. The DNS
+error is the real issue.
+
+**Cause** — The libvirt dnsmasq DNS config was missing `api-int.ocp.lab.local`.
+OCP nodes use `api-int` (the internal API endpoint) for intra-cluster
+communication during installation. It must resolve to `api_vip`
+(`192.168.200.10`) from within every node. Without it, the kubelet and cluster
+operators cannot reach the API server and the install eventually stalls.
+
+The `labnet.xml.j2` template had `api.ocp.lab.local` → 192.168.200.10 but
+was missing the `api-int` alias on the same IP.
+
+**Fix — inject into the live running network** (no VM or network restart needed):
+
+```bash
+sudo virsh -c qemu:///system net-update labnet add dns-host \
+  '<host ip="192.168.200.10"><hostname>api-int.ocp.lab.local</hostname></host>' \
+  --live --config
+```
+
+Verify:
+```bash
+dig api-int.ocp.lab.local @192.168.200.1 +short
+# expected: 192.168.200.10
+```
+
+The `labnet.xml.j2` template now includes `api-int` so future runs do not
+require this manual step.
+
+---
+
 ### Check VM console
 
 ```bash
