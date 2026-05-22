@@ -155,14 +155,29 @@ The `vms` role detects the ISO and boots all nodes.
 ansible-playbook site.yml --tags vms
 ```
 
-### 6 — Eject the agent ISO (after bootstrap completes)
+### 6 — Eject the agent ISO (as soon as image write completes)
 
-Once `wait-for bootstrap-complete` finishes, eject the ISO from all VMs.
-UEFI NVRAM already boots the installed disk, but ejecting prevents accidental
-re-installation if NVRAM is ever cleared.
+Eject the ISO **as soon as the installer logs `Writing image to disk: 100%`**
+for each node — do not wait for bootstrap-complete. UEFI NVRAM does not
+reliably override the XML boot order on KVM; leaving the ISO attached causes
+nodes to reboot back into the installer instead of the disk, stalling the
+install with:
+
+```
+Expected the host to boot from disk, but it booted the installation image
+```
+
+Eject all nodes at once (safe to run even while nodes are up):
 
 ```bash
 ansible-playbook eject-iso.yml
+```
+
+If a node already booted back into the ISO, eject and reboot it:
+
+```bash
+sudo virsh -c qemu:///system change-media <vm> sda --eject --live --config
+sudo virsh -c qemu:///system reboot <vm>
 ```
 
 ### 8 — Monitor installation
