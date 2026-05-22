@@ -456,6 +456,44 @@ sudo systemctl restart named
 
 ---
 
+### [T6] `exec: "nmstatectl": executable file not found in $PATH`
+
+**Symptom** — `generate-ocp-config.yml` fails at the "Generate agent ISO" task:
+
+```
+level=fatal msg=failed to generate asset "NMState Config": staticNetwork
+  configuration is not valid: 5 errors occurred:
+level=fatal msg=  * failed to validate network yaml for host 0, install
+  nmstate package, exec: "nmstatectl": executable file not found in $PATH
+...
+```
+
+**Cause** — `openshift-install agent create image` shells out to `nmstatectl`
+to validate every host's static network YAML before writing the ISO. The
+`nmstate` package (which provides `nmstatectl`) is a runtime dependency of the
+agent-based installer but was not in the KVM host package list.
+
+**Fix** — Install `nmstate` on the machine running `openshift-install`:
+
+```bash
+sudo dnf install -y nmstate
+```
+
+Verify:
+```bash
+nmstatectl version
+```
+
+Then re-run the playbook:
+```bash
+ansible-playbook generate-ocp-config.yml
+```
+
+The `packages` role now includes `nmstate` so it will be installed
+automatically on future `ansible-playbook site.yml` runs.
+
+---
+
 ### Check VM console
 
 ```bash
