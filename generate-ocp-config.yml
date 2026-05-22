@@ -52,7 +52,7 @@
 
     - name: Set helper facts
       ansible.builtin.set_fact:
-        pull_secret: "{{ pull_secret_raw.content | b64decode | trim }}"
+        pull_secret: "{{ pull_secret_raw.content | b64decode | from_json | to_json }}"
         ssh_pub_key: "{{ ssh_pub_key_raw.content | b64decode | trim }}"
 
   tasks:

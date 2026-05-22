@@ -25,5 +25,5 @@ controlPlane:
 platform:
   none: {}
 
-pullSecret: '{{ pull_secret }}'
-sshKey: '{{ ssh_pub_key }}'
+pullSecret: {{ pull_secret | to_json }}
+sshKey: {{ ssh_pub_key | to_json }}
