@@ -570,8 +570,15 @@ makes even a fast SSD appear to do <20 IOPS, far below OCP's 10 MB/s threshold.
 error: Operation not supported: cannot modify field 'cache' of the disk
 ```
 
-**Fix** — Change the VM disk cache mode to `writeback` so guest fsyncs only
-flush the VM's page cache (not the host's), then destroy and redefine the VMs:
+**Why `writeback` is not enough** — `cache=writeback` was tried first but
+also fails on a spinning HDD. With `writeback`, QEMU still calls the host
+`fsync()` for every guest `fdatasync`, so the 480-second timeout is hit on
+the second and subsequent test rounds (the first round passes because the
+page cache is cold and fsyncs return quickly; by round 2, the HDD is busy
+flushing dirty pages from round 1 and both rounds compete for the same disk).
+
+**Fix** — Use `cache=unsafe`, which makes guest `fdatasync` a complete no-op
+on the host. fio completes in seconds writing into the host page cache.
 
 ```bash
 # 1. Destroy and undefine all VMs (qcow2 files are preserved)
@@ -580,16 +587,15 @@ for vm in ocp-control-1 ocp-control-2 ocp-control-3 ocp-worker-1 ocp-worker-2; d
   sudo virsh -c qemu:///system undefine $vm --nvram
 done
 
-# 2. Redefine with cache='writeback' io='threads' and start
+# 2. Redefine with cache='unsafe' io='threads' and start
 ansible-playbook site.yml --tags vms
 ```
 
-The `vm.xml.j2` template now uses `cache='writeback' io='threads'` so this is
-not required on fresh runs.
+The `vm.xml.j2` template now uses `cache='unsafe' io='threads'`.
 
-**Trade-off** — `writeback` improves guest write performance but means a KVM
-host crash with dirty pages could corrupt the qcow2 image. Acceptable for a
-lab; use `cache='none'` for production VMs on reliable storage.
+**Trade-off** — Guest fsyncs are never flushed to the physical disk; a KVM
+host crash during install could corrupt the qcow2 image. Acceptable for a
+lab. Do NOT use for production VMs or any data you cannot afford to lose.
 
 ---
 
