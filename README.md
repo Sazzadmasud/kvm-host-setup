@@ -155,7 +155,17 @@ The `vms` role detects the ISO and boots all nodes.
 ansible-playbook site.yml --tags vms
 ```
 
-### 6 — Monitor installation
+### 6 — Eject the agent ISO (after bootstrap completes)
+
+Once `wait-for bootstrap-complete` finishes, eject the ISO from all VMs.
+UEFI NVRAM already boots the installed disk, but ejecting prevents accidental
+re-installation if NVRAM is ever cleared.
+
+```bash
+ansible-playbook eject-iso.yml
+```
+
+### 8 — Monitor installation
 
 ```bash
 # Wait for bootstrap to complete (~15 min)
@@ -167,7 +177,7 @@ openshift-install --dir=/opt/ocp/cluster agent wait-for install-complete \
   --log-level=info
 ```
 
-### 7 — Access the cluster
+### 9 — Access the cluster
 
 ```bash
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig

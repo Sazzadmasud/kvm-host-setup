@@ -1,0 +1,35 @@
+---
+# Run this after: openshift-install agent wait-for bootstrap-complete
+#
+# Ejects the agent ISO from all VMs so that a future NVRAM wipe or
+# virsh undefine --nvram cannot accidentally re-boot nodes into the
+# installer. The qcow2 disks already have the UEFI bootloader registered,
+# so ejecting the CD-ROM is safe at any point after image-write completes.
+#
+# Usage:
+#   ansible-playbook eject-iso.yml
+
+- name: Eject agent ISO from all OCP VMs
+  hosts: kvm_hosts
+  gather_facts: false
+
+  tasks:
+    - name: Build full VM list
+      ansible.builtin.set_fact:
+        all_vm_names: "{{ (control_nodes + worker_nodes) | map(attribute='name') | list }}"
+
+    - name: Eject ISO from each VM (live + persist to config)
+      ansible.builtin.command: >
+        virsh -c qemu:///system change-media {{ item }} sda --eject --live --config
+      loop: "{{ all_vm_names }}"
+      register: eject_result
+      changed_when: eject_result.rc == 0
+      failed_when: eject_result.rc != 0 and 'not a media' not in eject_result.stderr
+                                         and 'No such' not in eject_result.stderr
+
+    - name: Report eject status
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ 'ejected' if item.rc == 0 else 'skipped (' + item.stderr | trim + ')' }}"
+      loop: "{{ eject_result.results }}"
+      loop_control:
+        label: "{{ item.item }}"
