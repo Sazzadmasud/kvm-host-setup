@@ -43,6 +43,9 @@
     - role: networks
       tags: [networks]
 
+    - role: haproxy
+      tags: [haproxy]
+
     - role: storage_pool
       tags: [storage, storage_pool]
 

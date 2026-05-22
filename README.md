@@ -66,6 +66,7 @@ kvm-host-setup/
 │   ├── packages/tasks/main.yml        # dnf + openshift-install + oc downloads
 │   ├── libvirt_setup/tasks/main.yml   # Modular daemons, qemu.conf, groups, sysctl
 │   ├── networks/tasks/main.yml        # Define labnet + DNS/hosts config
+│   ├── haproxy/tasks/main.yml         # HAProxy LB config + VIP assignment to virbr4
 │   ├── storage_pool/tasks/main.yml    # /opt/images pool
 │   └── vms/tasks/main.yml            # Disk images + VM XML definitions
 │
@@ -637,6 +638,51 @@ dig api-int.ocp.lab.local @192.168.200.1 +short
 
 The `labnet.xml.j2` template now includes `api-int` so future runs do not
 require this manual step.
+
+---
+
+### [T10] HAProxy pointing to wrong backend IPs; API/Ingress VIPs unreachable
+
+**Symptom** — After bootstrap starts, `openshift-install agent wait-for
+bootstrap-complete` cannot connect. The API and Ingress VIPs don't respond:
+
+```bash
+ping 192.168.200.10   # 100% packet loss
+curl -k https://api.ocp.lab.local:6443   # connection refused / timeout
+```
+
+Inspecting `/etc/haproxy/haproxy.cfg` shows backends pointing to
+`192.168.200.210–213` and `226–227` instead of the actual node IPs, and
+the VIPs are not assigned to `virbr4`.
+
+**Cause** — HAProxy was not managed by the Ansible project. A stale config
+from a previous install used a different IP scheme. Additionally, the VIPs
+(`192.168.200.10` and `192.168.200.11`) must be explicitly assigned to
+`virbr4` on the KVM host so the host can respond to ARP for those addresses
+and HAProxy can accept connections on them.
+
+**Immediate fix** — Correct the backends and assign the VIPs:
+
+```bash
+# 1. Write correct HAProxy config
+ansible-playbook site.yml --tags haproxy
+
+# OR manually:
+sudo systemctl restart haproxy
+
+# 2. Assign VIPs to the bridge (if not yet present)
+sudo ip addr add 192.168.200.10/32 dev virbr4
+sudo ip addr add 192.168.200.11/32 dev virbr4
+
+# 3. Verify
+curl -k --connect-timeout 5 https://api.ocp.lab.local:6443/readyz
+```
+
+**Permanent fix** — The `haproxy` role now generates `/etc/haproxy/haproxy.cfg`
+from a Jinja2 template using `control_nodes` and `worker_nodes` variables, and
+assigns the VIPs to `virbr4` via `ip addr`. A NetworkManager dispatcher script
+at `/etc/NetworkManager/dispatcher.d/99-ocp-vips` re-assigns the VIPs after
+each reboot.
 
 ---
 

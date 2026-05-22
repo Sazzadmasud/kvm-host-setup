@@ -1,0 +1,72 @@
+global
+    log stdout format raw local0
+    maxconn 20000
+
+defaults
+    log     global
+    option  tcplog
+    option  dontlognull
+    retries 3
+    timeout connect 10s
+    timeout client  1m
+    timeout server  1m
+
+#---------------------------------------------------------------------
+# API server — port 6443
+#---------------------------------------------------------------------
+frontend api
+    bind *:6443
+    mode tcp
+    default_backend api-backend
+
+backend api-backend
+    mode tcp
+    balance roundrobin
+{% for node in control_nodes %}
+    server {{ node.name }} {{ node.ip }}:6443 check
+{% endfor %}
+
+#---------------------------------------------------------------------
+# Machine Config server — port 22623
+#---------------------------------------------------------------------
+frontend machine-config
+    bind *:22623
+    mode tcp
+    default_backend mc-backend
+
+backend mc-backend
+    mode tcp
+    balance roundrobin
+{% for node in control_nodes %}
+    server {{ node.name }} {{ node.ip }}:22623 check
+{% endfor %}
+
+#---------------------------------------------------------------------
+# Ingress HTTP — port 80
+#---------------------------------------------------------------------
+frontend ingress-http
+    bind *:80
+    mode tcp
+    default_backend ingress-http-backend
+
+backend ingress-http-backend
+    mode tcp
+    balance roundrobin
+{% for node in worker_nodes %}
+    server {{ node.name }} {{ node.ip }}:80 check
+{% endfor %}
+
+#---------------------------------------------------------------------
+# Ingress HTTPS — port 443
+#---------------------------------------------------------------------
+frontend ingress-https
+    bind *:443
+    mode tcp
+    default_backend ingress-https-backend
+
+backend ingress-https-backend
+    mode tcp
+    balance roundrobin
+{% for node in worker_nodes %}
+    server {{ node.name }} {{ node.ip }}:443 check
+{% endfor %}
