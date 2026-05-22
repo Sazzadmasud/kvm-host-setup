@@ -494,6 +494,56 @@ automatically on future `ansible-playbook site.yml` runs.
 
 ---
 
+### [T7] `interfaces: unknown field 'macAddress' at line 6 column 1`
+
+**Symptom** — After installing `nmstate`, the ISO generation still fails:
+
+```
+level=error msg=Provide file is not valid NetworkState or NetworkPolicy:
+  interfaces: unknown field `macAddress` at line 6 column 1
+level=fatal msg=  * failed to validate network yaml for host 0, failed to
+  execute 'nmstatectl gc', error: Nmstate version: 2.2.57
+```
+
+**Cause** — `agent-config.yaml` uses `macAddress` (camelCase) inside the
+`networkConfig.interfaces` block. That block is NMState YAML. NMState 2.x
+requires the hyphenated form `mac-address`; camelCase was only accepted by
+older nmstate 1.x.
+
+Note the two different contexts in `agent-config.yaml`:
+
+| Location | Field name | Why |
+|---|---|---|
+| `hosts[].interfaces[].macAddress` | `macAddress` | OCP `AgentConfig` API — matches the physical NIC to configure |
+| `hosts[].networkConfig.interfaces[].mac-address` | `mac-address` | NMState 2.x format — sets the MAC in the network state |
+
+**Fix** — In `ocp-config/agent-config.yaml.j2`, change `macAddress` to
+`mac-address` inside every `networkConfig.interfaces` block only:
+
+```yaml
+# WRONG (nmstate 1.x / camelCase)
+networkConfig:
+  interfaces:
+    - name: enp1s0
+      macAddress: 52:54:00:c0:01:01   # ← fails with nmstate 2.x
+
+# CORRECT (nmstate 2.x / hyphenated)
+networkConfig:
+  interfaces:
+    - name: enp1s0
+      mac-address: 52:54:00:c0:01:01  # ← accepted
+```
+
+The top-level `interfaces[].macAddress` entries (the OCP host-interface
+matcher) keep the camelCase form — that is part of the OCP API, not NMState.
+
+The template has been updated; re-run:
+```bash
+ansible-playbook generate-ocp-config.yml
+```
+
+---
+
 ### Check VM console
 
 ```bash

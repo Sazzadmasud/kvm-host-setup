@@ -17,7 +17,7 @@ hosts:
         - name: enp1s0
           type: ethernet
           state: up
-          macAddress: {{ node.mac }}
+          mac-address: {{ node.mac }}
           ipv4:
             enabled: true
             address:
@@ -46,7 +46,7 @@ hosts:
         - name: enp1s0
           type: ethernet
           state: up
-          macAddress: {{ node.mac }}
+          mac-address: {{ node.mac }}
           ipv4:
             enabled: true
             address:
