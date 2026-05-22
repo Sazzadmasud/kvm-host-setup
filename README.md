@@ -544,7 +544,56 @@ ansible-playbook generate-ocp-config.yml
 
 ---
 
-### [T8] `Error while evaluating DNS resolution on this host` during bootstrap
+### [T8] `installation-disk-speed-check` times out (exit code 124) on all hosts
+
+**Symptom** — After nodes boot and reach `preparing-for-installation`, the
+assisted-service repeatedly submits a disk speed check that times out after
+480 seconds on every node. The service log shows:
+
+```
+exit-code <124> stderr <kill container: No such process ...>
+error="unexpected end of JSON input"
+```
+
+The check runs:
+```
+fio --rw=write --ioengine=sync --size=22m --bs=2300 --fdatasync=1
+```
+This performs ~10,000 sequential writes each followed by an `fdatasync`. With
+`cache='none'` (the VM default), every guest `fdatasync` flushes straight
+through to the physical disk — and on a new qcow2 image, each write also
+triggers a cluster allocation + L2 table update flush. The combined overhead
+makes even a fast SSD appear to do <20 IOPS, far below OCP's 10 MB/s threshold.
+
+`virsh update-device --live` cannot change cache mode on a running disk:
+```
+error: Operation not supported: cannot modify field 'cache' of the disk
+```
+
+**Fix** — Change the VM disk cache mode to `writeback` so guest fsyncs only
+flush the VM's page cache (not the host's), then destroy and redefine the VMs:
+
+```bash
+# 1. Destroy and undefine all VMs (qcow2 files are preserved)
+for vm in ocp-control-1 ocp-control-2 ocp-control-3 ocp-worker-1 ocp-worker-2; do
+  sudo virsh -c qemu:///system destroy $vm 2>/dev/null
+  sudo virsh -c qemu:///system undefine $vm --nvram
+done
+
+# 2. Redefine with cache='writeback' io='threads' and start
+ansible-playbook site.yml --tags vms
+```
+
+The `vm.xml.j2` template now uses `cache='writeback' io='threads'` so this is
+not required on fresh runs.
+
+**Trade-off** — `writeback` improves guest write performance but means a KVM
+host crash with dirty pages could corrupt the qcow2 image. Acceptable for a
+lab; use `cache='none'` for production VMs on reliable storage.
+
+---
+
+### [T9] `Error while evaluating DNS resolution on this host` during bootstrap
 
 **Symptom** — After VMs boot and agents connect, DNS validation warnings appear
 for all hosts and never clear:

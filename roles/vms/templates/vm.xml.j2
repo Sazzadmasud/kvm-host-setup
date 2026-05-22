@@ -34,7 +34,7 @@
   <devices>
     <!-- Primary boot disk -->
     <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2' discard='unmap' cache='none' io='native'/>
+      <driver name='qemu' type='qcow2' discard='unmap' cache='writeback' io='threads'/>
       <source file='{{ libvirt_storage_pool_path }}/{{ vm.name }}.qcow2'/>
       <target dev='vda' bus='virtio'/>
       <boot order='2'/>
