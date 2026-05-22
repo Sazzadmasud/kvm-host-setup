@@ -60,7 +60,46 @@
   changed_when: true
 
 # ──────────────────────────────────────────────
-#  4. Remove stale vnet interfaces
+#  4. Kill stale dnsmasq processes not tracked by virtnetworkd
+#     These are left behind when networks were created by the old
+#     monolithic libvirtd and the modular daemons don't see them.
+# ──────────────────────────────────────────────
+- name: Find stale libvirt dnsmasq PID files
+  ansible.builtin.find:
+    paths: /var/run/libvirt/network
+    patterns: "*.pid"
+  register: stale_pid_files
+  ignore_errors: true
+
+- name: Kill stale dnsmasq processes from PID files
+  ansible.builtin.shell: |
+    pid=$(cat {{ item.path }} 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  loop: "{{ stale_pid_files.files | default([]) }}"
+  ignore_errors: true
+  changed_when: true
+
+- name: Remove all stale libvirt network runtime state
+  ansible.builtin.file:
+    path: /var/run/libvirt/network
+    state: absent
+  ignore_errors: true
+
+- name: Recreate empty libvirt network runtime dir
+  ansible.builtin.file:
+    path: /var/run/libvirt/network
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Remove stale dnsmasq virbr status files
+  ansible.builtin.shell: "rm -f /var/lib/libvirt/dnsmasq/virbr*.status"
+  ignore_errors: true
+  changed_when: true
+
+# ──────────────────────────────────────────────
+#  5. Remove stale vnet and virbr interfaces
 # ──────────────────────────────────────────────
 - name: Find stale vnet interfaces
   ansible.builtin.shell: "ip link show | grep -oP 'vnet[0-9]+' || true"
@@ -73,8 +112,19 @@
   ignore_errors: true
   changed_when: true
 
+- name: Find stale virbr interfaces
+  ansible.builtin.shell: "ip link show | grep -oP 'virbr[0-9]+(?=:)' || true"
+  register: virbr_ifaces
+  changed_when: false
+
+- name: Delete stale virbr interfaces
+  ansible.builtin.command: "ip link delete {{ item }}"
+  loop: "{{ virbr_ifaces.stdout_lines | select('ne', '') | list }}"
+  ignore_errors: true
+  changed_when: true
+
 # ──────────────────────────────────────────────
-#  5. Wipe OCP/image directories on /opt
+#  6. Wipe OCP/image directories on /opt
 # ──────────────────────────────────────────────
 - name: Remove OCP and image directories
   ansible.builtin.file:
@@ -90,7 +140,7 @@
   loop: "{{ cleanup_dirs }}"
 
 # ──────────────────────────────────────────────
-#  6. Free root filesystem space
+#  7. Free root filesystem space
 # ──────────────────────────────────────────────
 - name: Clean dnf package cache
   ansible.builtin.command: dnf clean all

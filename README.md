@@ -342,6 +342,52 @@ the steps above.
 
 ---
 
+### [T4] `dnsmasq: failed to create listening socket — Address already in use`
+
+**Symptom** — `networks` role fails when starting `labnet`:
+```
+error: Failed to start network labnet
+dnsmasq: failed to create listening socket for 192.168.200.1: Address already in use
+```
+
+**Cause** — Stale dnsmasq processes are still running from networks that were
+created by the old monolithic `libvirtd`. After switching to modular libvirt
+daemons (`virtnetworkd`), those networks are invisible to `virsh net-list` so
+the cleanup role's `virsh net-destroy` skips them — but their dnsmasq
+processes and PID files remain in `/var/run/libvirt/network/`.
+
+Diagnose:
+```bash
+ls /var/run/libvirt/network/      # stale *.pid files are the giveaway
+ls /var/lib/libvirt/dnsmasq/     # virbr*.status files also indicate stale state
+```
+
+**Fix** — Kill the orphaned processes and clear the stale runtime state, then
+retry:
+
+```bash
+# Kill dnsmasq processes still referenced by stale PID files
+sudo kill $(cat /var/run/libvirt/network/br_labnet.pid) 2>/dev/null
+sudo kill $(cat /var/run/libvirt/network/provisioning.pid) 2>/dev/null
+
+# Remove all stale runtime state
+sudo rm -f /var/run/libvirt/network/br_labnet.pid \
+           /var/run/libvirt/network/provisioning.pid \
+           /var/run/libvirt/network/br_labnet \
+           /var/run/libvirt/network/autostarted \
+           /var/lib/libvirt/dnsmasq/virbr*.status
+
+# Retry
+ansible-playbook site.yml --tags networks
+```
+
+**Fix in the cleanup role** — The `cleanup` role now automatically finds and
+kills all PID files under `/var/run/libvirt/network/` and wipes the stale
+virbr status files before attempting any virsh operations, so this should not
+recur on subsequent full runs.
+
+---
+
 ### Check VM console
 
 ```bash
