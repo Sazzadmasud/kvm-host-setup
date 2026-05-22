@@ -57,14 +57,14 @@
     loop_var: vm
 
 - name: Check which VMs are already defined
-  ansible.builtin.command: "virsh dominfo {{ item.name }}"
+  ansible.builtin.command: "virsh -c qemu:///system dominfo {{ item.name }}"
   register: dominfo_results
   changed_when: false
   ignore_errors: true
   loop: "{{ all_vms }}"
 
 - name: Define VMs that are not yet defined
-  ansible.builtin.command: "virsh define /tmp/{{ item.item.name }}.xml"
+  ansible.builtin.command: "virsh -c qemu:///system define /tmp/{{ item.item.name }}.xml"
   when: item.rc != 0
   loop: "{{ dominfo_results.results }}"
   changed_when: true
@@ -78,7 +78,7 @@
   register: agent_iso
 
 - name: Start all VMs (agent ISO present — beginning install)
-  ansible.builtin.command: "virsh start {{ item.name }}"
+  ansible.builtin.command: "virsh -c qemu:///system start {{ item.name }}"
   loop: "{{ all_vms }}"
   when: agent_iso.stat.exists
   register: vm_start

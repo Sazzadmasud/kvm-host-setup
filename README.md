@@ -378,9 +378,30 @@ sudo rm -rf /var/run/libvirt/network/* \
 ansible-playbook site.yml --tags networks
 ```
 
-**If the error persists after clearing PID files** — NetworkManager may be
-grabbing port 53 on the bridge IP the instant libvirt creates `virbr4`. Fix
-by marking libvirt interfaces as unmanaged in NM and reloading its config:
+**If the error persists after clearing PID files** — the libvirt `default`
+network may still be active and its dnsmasq may be binding to a wildcard
+address. The root cause is that `virsh net-list` without root returns an
+empty list (connects to the user session socket, not the system socket), so
+the cleanup role was silently skipping the `default` network.
+
+Verify with sudo:
+```bash
+sudo virsh -c qemu:///system net-list --all
+```
+
+Destroy the default network, then retry:
+```bash
+sudo virsh -c qemu:///system net-destroy default
+sudo virsh -c qemu:///system net-undefine default
+ansible-playbook site.yml --tags networks
+```
+
+All `virsh` calls in the playbooks now use `-c qemu:///system` explicitly so
+they always connect to the system socket regardless of the user running them.
+The cleanup role no longer skips the `default` network.
+
+The `libvirt_setup` role also writes an NM config to leave `virbr*`/`vnet*`
+interfaces unmanaged, preventing NM from racing for port 53:
 
 ```bash
 sudo tee /etc/NetworkManager/conf.d/99-libvirt.conf <<'EOF'
@@ -388,10 +409,7 @@ sudo tee /etc/NetworkManager/conf.d/99-libvirt.conf <<'EOF'
 unmanaged-devices=interface-name:virbr*;interface-name:vnet*
 EOF
 sudo nmcli general reload conf
-ansible-playbook site.yml --tags networks
 ```
-
-The `libvirt_setup` role now writes this file automatically on every run.
 
 ---
 

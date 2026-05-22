@@ -9,22 +9,22 @@
     mode: "0644"
 
 - name: Check if labnet is already defined
-  ansible.builtin.command: "virsh net-info {{ ocp_network_name }}"
+  ansible.builtin.command: "virsh -c qemu:///system net-info {{ ocp_network_name }}"
   register: net_info
   changed_when: false
   ignore_errors: true
 
 - name: Define labnet
-  ansible.builtin.command: "virsh net-define /tmp/labnet.xml"
+  ansible.builtin.command: "virsh -c qemu:///system net-define /tmp/labnet.xml"
   when: net_info.rc != 0
   changed_when: true
 
 - name: Autostart labnet
-  ansible.builtin.command: "virsh net-autostart {{ ocp_network_name }}"
+  ansible.builtin.command: "virsh -c qemu:///system net-autostart {{ ocp_network_name }}"
   changed_when: true
 
 - name: Start labnet
-  ansible.builtin.command: "virsh net-start {{ ocp_network_name }}"
+  ansible.builtin.command: "virsh -c qemu:///system net-start {{ ocp_network_name }}"
   register: net_start
   changed_when: net_start.rc == 0
   failed_when: net_start.rc != 0 and 'already active' not in net_start.stderr

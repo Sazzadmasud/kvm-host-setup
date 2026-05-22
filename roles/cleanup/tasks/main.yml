@@ -3,39 +3,39 @@
 #  1. Destroy and undefine all VMs
 # ──────────────────────────────────────────────
 - name: Get list of all defined VMs
-  ansible.builtin.command: virsh list --all --name
+  ansible.builtin.command: virsh -c qemu:///system list --all --name
   register: all_vms
   changed_when: false
 
 - name: Destroy running VMs
-  ansible.builtin.command: "virsh destroy {{ item }}"
+  ansible.builtin.command: "virsh -c qemu:///system destroy {{ item }}"
   loop: "{{ all_vms.stdout_lines | select('ne', '') | list }}"
   ignore_errors: true
   changed_when: true
 
 - name: Undefine VMs (remove NVRAM/firmware state)
-  ansible.builtin.command: "virsh undefine {{ item }} --nvram --remove-all-storage"
+  ansible.builtin.command: "virsh -c qemu:///system undefine {{ item }} --nvram --remove-all-storage"
   loop: "{{ all_vms.stdout_lines | select('ne', '') | list }}"
   ignore_errors: true
   changed_when: true
 
 # ──────────────────────────────────────────────
-#  2. Destroy and undefine all non-default networks
+#  2. Destroy and undefine ALL networks (including default)
 # ──────────────────────────────────────────────
 - name: Get list of all defined networks
-  ansible.builtin.command: virsh net-list --all --name
+  ansible.builtin.command: virsh -c qemu:///system net-list --all --name
   register: all_networks
   changed_when: false
 
 - name: Destroy active networks
-  ansible.builtin.command: "virsh net-destroy {{ item }}"
-  loop: "{{ all_networks.stdout_lines | select('ne', '') | reject('eq', 'default') | list }}"
+  ansible.builtin.command: "virsh -c qemu:///system net-destroy {{ item }}"
+  loop: "{{ all_networks.stdout_lines | select('ne', '') | list }}"
   ignore_errors: true
   changed_when: true
 
 - name: Undefine networks
-  ansible.builtin.command: "virsh net-undefine {{ item }}"
-  loop: "{{ all_networks.stdout_lines | select('ne', '') | reject('eq', 'default') | list }}"
+  ansible.builtin.command: "virsh -c qemu:///system net-undefine {{ item }}"
+  loop: "{{ all_networks.stdout_lines | select('ne', '') | list }}"
   ignore_errors: true
   changed_when: true
 
@@ -43,18 +43,18 @@
 #  3. Destroy and undefine all storage pools
 # ──────────────────────────────────────────────
 - name: Get list of all storage pools
-  ansible.builtin.command: virsh pool-list --all --name
+  ansible.builtin.command: virsh -c qemu:///system pool-list --all --name
   register: all_pools
   changed_when: false
 
 - name: Destroy active pools
-  ansible.builtin.command: "virsh pool-destroy {{ item }}"
+  ansible.builtin.command: "virsh -c qemu:///system pool-destroy {{ item }}"
   loop: "{{ all_pools.stdout_lines | select('ne', '') | list }}"
   ignore_errors: true
   changed_when: true
 
 - name: Undefine storage pools
-  ansible.builtin.command: "virsh pool-undefine {{ item }}"
+  ansible.builtin.command: "virsh -c qemu:///system pool-undefine {{ item }}"
   loop: "{{ all_pools.stdout_lines | select('ne', '') | list }}"
   ignore_errors: true
   changed_when: true
