@@ -228,6 +228,120 @@ host and are avoided.
 
 ## Troubleshooting
 
+### [T1] `Invalid callback for stdout specified: yaml`
+
+**Symptom** — First `ansible-playbook` run fails immediately:
+```
+ERROR! Invalid callback for stdout specified: yaml
+```
+
+**Cause** — `ansible-core` on Fedora 42 does not ship the `yaml` stdout
+callback plugin. Only `ansible.builtin.*` callbacks are available without
+extra collections.
+
+**Fix** — Use the built-in `default` callback and the FQCN for
+`profile_tasks` in `ansible.cfg`:
+
+```ini
+[defaults]
+stdout_callback   = ansible.builtin.default
+callbacks_enabled = ansible.posix.profile_tasks
+```
+
+To check which callbacks are available on your system:
+```bash
+ansible-doc -t callback -l
+```
+
+---
+
+### [T2] `sudo: a password is required` — fact gathering fails
+
+**Symptom** — Playbook fails at `Gathering Facts`:
+```
+fatal: [kvm_host]: FAILED! => {
+  "msg": "MODULE FAILURE ... sudo: a password is required"
+}
+```
+
+**Cause** — `become = True` is set globally in `ansible.cfg` so Ansible
+tries to run even fact gathering as root, but no sudo password was supplied.
+
+**Fix** — Add `become_ask_pass = True` to `ansible.cfg` so Ansible prompts
+for the sudo password at the start of each run:
+
+```ini
+[privilege_escalation]
+become          = True
+become_method   = sudo
+become_ask_pass = True
+```
+
+Alternatively, pass `-K` on the command line:
+```bash
+ansible-playbook site.yml -K
+```
+
+---
+
+### [T3] DNS resolution broken — `Could not resolve host`
+
+**Symptom** — `packages` role fails when DNF tries to download metadata:
+```
+fatal: [kvm_host]: FAILED! => {
+  "msg": "Failed to download metadata ... Cannot prepare internal mirrorlist:
+          Curl error (6): Could not resolve hostname for
+          https://mirrors.fedoraproject.org ..."
+}
+```
+
+**Cause** — Two stale configurations from a previous OCP lab deployment were
+poisoning the host DNS:
+
+1. **`/etc/systemd/resolved.conf`** was hardcoded to `DNS=127.0.0.1` — a
+   dnsmasq instance that no longer exists after cleanup — and
+   `DNSStubListener=no`, disabling the 127.0.0.53 stub resolver.
+
+2. **NetworkManager `virbr1` connection profile** had `ipv4.dns=192.168.10.2`
+   (the old provisioning network gateway) which NM pushes to systemd-resolved
+   as a global DNS server even when the interface is down.
+
+Together these routed all DNS queries to dead servers. Diagnosing:
+```bash
+resolvectl status          # shows Global DNS, Domains, resolv.conf mode
+nmcli connection show virbr1 | grep dns
+cat /etc/systemd/resolved.conf
+```
+
+**Fix** — Reset systemd-resolved to use public DNS, re-enable the stub
+listener, and delete the dead virbr1 NM connection profile:
+
+```bash
+# 1. Fix systemd-resolved
+sudo tee /etc/systemd/resolved.conf <<'EOF'
+[Resolve]
+DNS=8.8.8.8 1.1.1.1
+FallbackDNS=8.8.4.4 9.9.9.9
+DNSStubListener=yes
+EOF
+
+# 2. Delete the stale virbr1 NM connection (provisioning net is gone)
+sudo nmcli connection delete virbr1
+
+# 3. Restart both services
+sudo systemctl restart systemd-resolved NetworkManager
+
+# 4. Verify resolution is working
+dig mirrors.fedoraproject.org +short | head -3
+```
+
+**Root cause note** — The `cleanup` role destroys libvirt networks but does
+not remove the corresponding NetworkManager connection profiles or
+`/etc/systemd/resolved.conf`. If DNS breaks again after a cleanup run, repeat
+the steps above.
+
+---
+
 ### Check VM console
 
 ```bash
