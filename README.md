@@ -413,6 +413,49 @@ sudo nmcli general reload conf
 
 ---
 
+### [T5] `named` (BIND9) grabs port 53 on the bridge IP
+
+**Symptom** — Same `Address already in use` error on `192.168.200.1:53`.
+All previous fixes applied but the problem persists. Diagnostic:
+
+```bash
+sudo ss -tulnp | grep ':53'
+# shows: named pid=XXXXX listening on 127.0.0.1:53 and all interface IPs
+```
+
+**Cause** — BIND9 (`named`) was previously installed and is running as a
+system service. BIND listens on **all interfaces** by default, including
+new ones that appear dynamically. When libvirt creates `virbr4` with
+`192.168.200.1`, `named` immediately binds `192.168.200.1:53`, so libvirt's
+dnsmasq cannot bind to the same address moments later.
+
+**Fix** — Stop and disable `named`. For this KVM lab, libvirt's built-in
+dnsmasq provides DNS for the OCP network; BIND9 is not needed.
+
+```bash
+sudo systemctl stop named
+sudo systemctl disable named
+
+# Redefine the network and retry
+sudo virsh -c qemu:///system net-undefine labnet
+ansible-playbook site.yml --tags networks
+```
+
+The `libvirt_setup` role now automatically stops and disables `named` if it
+is found running, so this will not recur on future runs.
+
+**Note** — If you need `named` for other purposes, configure it to listen
+only on loopback instead:
+
+```bash
+# Add to /etc/named.conf options block:
+#   listen-on { 127.0.0.1; };
+#   listen-on-v6 { ::1; };
+sudo systemctl restart named
+```
+
+---
+
 ### Check VM console
 
 ```bash

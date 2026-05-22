@@ -132,6 +132,29 @@
   changed_when: true
 
 # ──────────────────────────────────────────────
+#  named (BIND9): stop it from grabbing port 53 on libvirt bridges
+#  named listens on ALL interfaces by default. When libvirt creates
+#  virbr4, named immediately binds 192.168.200.1:53, blocking libvirt's
+#  own dnsmasq. Restrict named to loopback only, or disable it entirely.
+# ──────────────────────────────────────────────
+- name: Check if named is running
+  ansible.builtin.systemd:
+    name: named
+  register: named_status
+  ignore_errors: true
+
+- name: Stop and disable named (BIND9 conflicts with libvirt dnsmasq)
+  ansible.builtin.systemd:
+    name: named
+    state: stopped
+    enabled: false
+  when:
+    - named_status is not failed
+    - named_status.status is defined
+    - named_status.status.ActiveState == 'active'
+  ignore_errors: true
+
+# ──────────────────────────────────────────────
 #  Firewall: allow libvirt traffic
 # ──────────────────────────────────────────────
 - name: Allow libvirt zone traffic (firewalld)
