@@ -55,7 +55,7 @@ while [[ $elapsed -lt $timeout ]]; do
                 ;;
             running)
                 if grep -qiE \
-                    "Host[[:space:]]+${vm}[^:]*:[[:space:]]*(Writing image[^)]*100|Rebooting)" \
+                    "Host:[[:space:]]+${vm}[^,]*,.*(Writing image.*100|Rebooting)" \
                     "$LOG" 2>/dev/null; then
                     echo "[$(date +%T)] $vm: image-write complete (log signal)"
                     eject_vm "$vm" yes
