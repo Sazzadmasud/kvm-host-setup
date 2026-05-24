@@ -21,12 +21,24 @@ elapsed=0
 
 eject_vm() {
     local vm=$1 live=$2
-    local flags="--eject --config"
-    [[ "$live" == yes ]] && flags="--eject --live --config"
-    if virsh -c qemu:///system change-media "$vm" sda $flags 2>/dev/null; then
-        echo "[$(date +%T)] $vm: ISO ejected (live=$live)"
+
+    if [[ "$live" == yes ]]; then
+        # Try live+persistent eject while VM is running
+        if virsh -c qemu:///system change-media "$vm" sda --eject --live --config 2>/dev/null; then
+            echo "[$(date +%T)] $vm: ISO ejected (live)"
+            touch "$COORD_DIR/$vm"
+            return
+        fi
+        # Live eject failed (common with SATA CDROMs) — fall through to config-only.
+        # Config-only removes the ISO from persistent XML so the node won't boot from
+        # the ISO after it reboots naturally following the image write.
+        echo "[$(date +%T)] $vm: live eject failed — applying config-only eject"
+    fi
+
+    if virsh -c qemu:///system change-media "$vm" sda --eject --config 2>/dev/null; then
+        echo "[$(date +%T)] $vm: ISO removed from persistent config (takes effect on reboot)"
     else
-        echo "[$(date +%T)] $vm: eject returned non-zero (may already be ejected)"
+        echo "[$(date +%T)] $vm: WARNING — eject failed entirely; node may reboot from ISO"
     fi
     touch "$COORD_DIR/$vm"
 }
