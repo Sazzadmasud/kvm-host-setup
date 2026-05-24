@@ -12,8 +12,8 @@
     name: python3-virtualenv
     state: present
 
-- name: Create sushy virtualenv
-  ansible.builtin.command: python3 -m venv /opt/sushy-venv
+- name: Create sushy virtualenv (system-site-packages for python3-libvirt)
+  ansible.builtin.command: python3 -m venv --system-site-packages /opt/sushy-venv
   args:
     creates: /opt/sushy-venv/bin/activate
 

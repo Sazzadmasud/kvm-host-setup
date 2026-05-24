@@ -32,21 +32,23 @@
   <on_crash>destroy</on_crash>
 
   <devices>
-    <!-- Primary boot disk -->
+    <!-- Primary boot disk — order 1 so that after RHCOS is installed the
+         EFI bootloader on vda wins on every reboot without any ISO eject. -->
     <disk type='file' device='disk'>
       <driver name='qemu' type='qcow2' discard='unmap' cache='unsafe' io='threads'/>
       <source file='{{ libvirt_storage_pool_path }}/{{ vm.name }}.qcow2'/>
       <target dev='vda' bus='virtio'/>
-      <boot order='2'/>
+      <boot order='1'/>
     </disk>
 
-    <!-- Agent ISO — boot order 1; remove after install -->
+    <!-- Agent ISO — boot order 2; UEFI falls through to this on first boot
+         when vda is empty, then never uses it again once RHCOS is installed. -->
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
       <source file='{{ ocp_install_dir }}/agent.x86_64.iso'/>
       <target dev='sda' bus='sata'/>
       <readonly/>
-      <boot order='1'/>
+      <boot order='2'/>
     </disk>
 
     <!-- NIC on OCP lab network -->
