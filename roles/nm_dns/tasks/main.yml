@@ -1,0 +1,28 @@
+---
+# Ensure NM uses dnsmasq mode (if not already set via another conf.d file)
+- name: Enable NM dnsmasq mode
+  ansible.builtin.copy:
+    dest: /etc/NetworkManager/conf.d/01-dnsmasq.conf
+    content: |
+      [main]
+      dns=dnsmasq
+    mode: "0644"
+  notify: reload NetworkManager
+
+# Forward all *.ocp.lab.local queries to BIND on port 5353
+- name: Deploy NM dnsmasq OCP forwarding config
+  ansible.builtin.template:
+    src: ocp.conf.j2
+    dest: /etc/NetworkManager/dnsmasq.d/ocp.conf
+    mode: "0644"
+  notify: reload NetworkManager
+
+# Remove any old config files from previous setups
+- name: Remove stale NM dnsmasq configs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/NetworkManager/dnsmasq.d/ocp-ocp.conf
+    - /etc/NetworkManager/conf.d/ocp-ocp.conf
+  notify: reload NetworkManager

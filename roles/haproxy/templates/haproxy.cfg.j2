@@ -12,10 +12,10 @@ defaults
     timeout server  1m
 
 #---------------------------------------------------------------------
-# API server — port 6443
+# API server — port 6443  (bound to API VIP {{ api_vip }})
 #---------------------------------------------------------------------
 frontend api
-    bind *:6443
+    bind {{ api_vip }}:6443
     mode tcp
     default_backend api-backend
 
@@ -27,10 +27,10 @@ backend api-backend
 {% endfor %}
 
 #---------------------------------------------------------------------
-# Machine Config server — port 22623
+# Machine Config server — port 22623  (bound to API VIP {{ api_vip }})
 #---------------------------------------------------------------------
 frontend machine-config
-    bind *:22623
+    bind {{ api_vip }}:22623
     mode tcp
     default_backend mc-backend
 
@@ -42,10 +42,10 @@ backend mc-backend
 {% endfor %}
 
 #---------------------------------------------------------------------
-# Ingress HTTP — port 80
+# Ingress HTTP — port 80  (bound to ingress VIP {{ ingress_vip }})
 #---------------------------------------------------------------------
 frontend ingress-http
-    bind *:80
+    bind {{ ingress_vip }}:80
     mode tcp
     default_backend ingress-http-backend
 
@@ -57,10 +57,10 @@ backend ingress-http-backend
 {% endfor %}
 
 #---------------------------------------------------------------------
-# Ingress HTTPS — port 443
+# Ingress HTTPS — port 443  (bound to ingress VIP {{ ingress_vip }})
 #---------------------------------------------------------------------
 frontend ingress-https
-    bind *:443
+    bind {{ ingress_vip }}:443
     mode tcp
     default_backend ingress-https-backend
 

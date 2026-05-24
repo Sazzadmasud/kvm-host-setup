@@ -1,10 +1,10 @@
----
-# Main playbook — full KVM host setup for OCP 4.18 (agent-based)
+# Main playbook — full KVM host setup for OCP agent-based install
 #
 # Usage:
 #   ansible-playbook site.yml                  # full run
 #   ansible-playbook site.yml --tags packages  # only install packages
 #   ansible-playbook site.yml --tags networks  # only configure networks
+#   ansible-playbook site.yml --tags dns       # only configure BIND9
 #   ansible-playbook site.yml --tags vms       # only create/start VMs
 
 - name: Setup KVM host for OCP
@@ -37,11 +37,23 @@
     - role: packages
       tags: [packages]
 
+    - role: swap
+      tags: [swap]
+
     - role: libvirt_setup
       tags: [libvirt, libvirt_setup]
 
     - role: networks
       tags: [networks]
+
+    - role: dns
+      tags: [dns]
+
+    - role: nm_dns
+      tags: [dns, nm_dns]
+
+    - role: vip
+      tags: [vip]
 
     - role: haproxy
       tags: [haproxy]
@@ -58,6 +70,7 @@
         msg:
           - "KVM host setup complete."
           - "Network: {{ ocp_network_name }} ({{ ocp_network_cidr }}) via {{ ocp_network_bridge }}"
+          - "DNS:     BIND9 on {{ ocp_network_gateway }}:53 (VMs) and 127.0.0.1:5353 (host NM-dnsmasq)"
           - "API VIP:     {{ api_vip }}  → api.{{ cluster_name }}.{{ base_domain }}"
           - "Ingress VIP: {{ ingress_vip }} → *.apps.{{ cluster_name }}.{{ base_domain }}"
           - ""
@@ -65,4 +78,4 @@
           - "  1. Copy your pull-secret to {{ ocp_base_dir }}/pull-secret.json"
           - "  2. Run: ansible-playbook generate-ocp-config.yml"
           - "  3. Run: ansible-playbook site.yml --tags vms  (starts VMs)"
-          - "  4. Monitor: openshift-install --dir={{ ocp_install_dir }} agent wait-for install-complete"
+          - "  4. Monitor: openshift-install --dir={{ ocp_install_dir }} agent wait-for bootstrap-complete"

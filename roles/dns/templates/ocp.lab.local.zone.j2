@@ -1,0 +1,30 @@
+; Zone: {{ cluster_name }}.{{ base_domain }}
+; Managed by Ansible — do not edit manually
+$TTL 3600
+@   IN SOA  ns1.{{ cluster_name }}.{{ base_domain }}. admin.{{ cluster_name }}.{{ base_domain }}. (
+            2026052301  ; serial
+            3600        ; refresh
+            900         ; retry
+            604800      ; expire
+            300 )       ; minimum TTL
+
+; Name server
+@           IN NS   ns1
+ns1         IN A    {{ ocp_network_gateway }}
+
+; API VIP — api and machine-config server
+api         IN A    {{ api_vip }}
+api-int     IN A    {{ api_vip }}
+
+; Ingress VIP — wildcard for all *.apps routes
+*.apps      IN A    {{ ingress_vip }}
+
+; Control plane nodes
+{% for node in control_nodes %}
+{{ node.name }}   IN A    {{ node.ip }}
+{% endfor %}
+
+; Worker nodes
+{% for node in worker_nodes %}
+{{ node.name }}   IN A    {{ node.ip }}
+{% endfor %}

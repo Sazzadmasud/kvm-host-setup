@@ -1,0 +1,30 @@
+#!/bin/bash
+# Libvirt network hook — managed by Ansible, do not edit manually
+#
+# Binds OCP VIPs to the lab bridge when the network starts, and removes
+# them when it stops. Also restarts named so BIND rebinds to the bridge IP.
+#
+# Arguments: <network-name> <action> <sub-action> <extra>
+#   action:     started | stopped | plugged | unplugged | updated
+#   sub-action: begin | end
+
+NETWORK=$1
+ACTION=$2
+
+[[ "$NETWORK" != "{{ ocp_network_name }}" ]] && exit 0
+
+case "$ACTION" in
+    started)
+        ip addr add {{ api_vip }}/32 dev {{ ocp_network_bridge }} 2>/dev/null || true
+        ip addr add {{ ingress_vip }}/32 dev {{ ocp_network_bridge }} 2>/dev/null || true
+        # Give the bridge a moment then restart BIND so it can bind to {{ ocp_network_gateway }}:53
+        sleep 1
+        systemctl restart named 2>/dev/null || true
+        ;;
+    stopped)
+        ip addr del {{ api_vip }}/32 dev {{ ocp_network_bridge }} 2>/dev/null || true
+        ip addr del {{ ingress_vip }}/32 dev {{ ocp_network_bridge }} 2>/dev/null || true
+        ;;
+esac
+
+exit 0

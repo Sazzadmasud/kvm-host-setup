@@ -1,0 +1,3 @@
+# Forward OCP lab DNS to BIND (port 5353 on localhost)
+# NM dnsmasq owns 127.0.0.1:53; BIND owns 127.0.0.1:5353 and {{ ocp_network_gateway }}:53
+server=/{{ cluster_name }}.{{ base_domain }}/127.0.0.1#5353

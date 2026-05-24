@@ -1,46 +1,51 @@
 ---
+# VIPs are bound by the libvirt network hook (roles/vip) — not managed here.
+# HAProxy binds to the specific VIPs in haproxy.cfg.j2 so it starts
+# after libvirtd to ensure virbr4 and the VIPs already exist.
+
+- name: Create systemd override dir for haproxy
+  ansible.builtin.file:
+    path: /etc/systemd/system/haproxy.service.d
+    state: directory
+    mode: "0755"
+
+- name: Override haproxy.service — start after libvirtd, auto-restart
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/haproxy.service.d/after-libvirt.conf
+    content: |
+      [Unit]
+      After=libvirtd.service
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+    mode: "0644"
+  notify:
+    - systemd daemon-reload
+    - restart haproxy
+
 - name: Deploy HAProxy config from template
   ansible.builtin.template:
     src: haproxy.cfg.j2
     dest: /etc/haproxy/haproxy.cfg
     mode: "0644"
-    validate: "haproxy -c -f %s"
   notify: restart haproxy
 
-- name: Enable and start HAProxy
+- name: Allow HAProxy ports in libvirt firewalld zone
+  ansible.posix.firewalld:
+    zone: libvirt
+    port: "{{ item }}"
+    state: enabled
+    permanent: true
+    immediate: true
+  loop:
+    - 6443/tcp
+    - 22623/tcp
+    - 80/tcp
+    - 443/tcp
+
+- name: Enable haproxy
   ansible.builtin.systemd:
     name: haproxy
     enabled: true
-    state: started
-
-# ──────────────────────────────────────────────
-#  Assign VIPs to the lab bridge so the KVM host
-#  can reach api.ocp.lab.local and *.apps.*
-# ──────────────────────────────────────────────
-- name: Assign API VIP to lab bridge
-  ansible.builtin.command: >
-    ip addr add {{ api_vip }}/32 dev {{ ocp_network_bridge }}
-  register: vip_api
-  changed_when: vip_api.rc == 0
-  failed_when: vip_api.rc != 0 and 'already exists' not in vip_api.stderr
-
-- name: Assign Ingress VIP to lab bridge
-  ansible.builtin.command: >
-    ip addr add {{ ingress_vip }}/32 dev {{ ocp_network_bridge }}
-  register: vip_ingress
-  changed_when: vip_ingress.rc == 0
-  failed_when: vip_ingress.rc != 0 and 'already exists' not in vip_ingress.stderr
-
-# Persist VIPs across reboots via a NetworkManager dispatcher script
-- name: Persist VIPs via nmcli
-  ansible.builtin.copy:
-    dest: /etc/NetworkManager/dispatcher.d/99-ocp-vips
-    mode: "0755"
-    content: |
-      #!/bin/bash
-      # Assign OCP VIPs to the lab bridge on each NetworkManager up event
-      BRIDGE="{{ ocp_network_bridge }}"
-      if [ "$1" = "$BRIDGE" ] && [ "$2" = "up" ]; then
-        ip addr add {{ api_vip }}/32 dev $BRIDGE 2>/dev/null || true
-        ip addr add {{ ingress_vip }}/32 dev $BRIDGE 2>/dev/null || true
-      fi
+    daemon_reload: true

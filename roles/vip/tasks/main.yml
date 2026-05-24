@@ -1,0 +1,30 @@
+---
+# Libvirt network hook: binds API and ingress VIPs to virbr4 when labnet starts
+# and triggers a named restart so BIND can bind to 192.168.200.1:53
+
+- name: Ensure libvirt hooks directory exists
+  ansible.builtin.file:
+    path: /etc/libvirt/hooks
+    state: directory
+    mode: "0755"
+
+- name: Deploy libvirt network hook
+  ansible.builtin.template:
+    src: network.hook.j2
+    dest: /etc/libvirt/hooks/network
+    mode: "0755"
+
+# Bind VIPs immediately if virbr4 already exists (e.g. re-run of playbook)
+- name: Bind API VIP to virbr4 if interface exists
+  ansible.builtin.command: ip addr add {{ api_vip }}/32 dev {{ ocp_network_bridge }}
+  register: vip_api
+  changed_when: vip_api.rc == 0
+  failed_when: false
+  when: ansible_facts.interfaces is defined and ocp_network_bridge in ansible_facts.interfaces
+
+- name: Bind ingress VIP to virbr4 if interface exists
+  ansible.builtin.command: ip addr add {{ ingress_vip }}/32 dev {{ ocp_network_bridge }}
+  register: vip_ingress
+  changed_when: vip_ingress.rc == 0
+  failed_when: false
+  when: ansible_facts.interfaces is defined and ocp_network_bridge in ansible_facts.interfaces

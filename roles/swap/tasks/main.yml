@@ -1,0 +1,34 @@
+---
+- name: Create 32G swap file on /opt if not present
+  ansible.builtin.command: dd if=/dev/zero of=/opt/swapfile bs=1M count=32768
+  args:
+    creates: /opt/swapfile
+
+- name: Set swap file permissions
+  ansible.builtin.file:
+    path: /opt/swapfile
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Check if swap file is already active
+  ansible.builtin.command: swapon --show=NAME --noheadings
+  register: active_swap
+  changed_when: false
+
+- name: Format swap file (only if not currently active)
+  ansible.builtin.command: mkswap /opt/swapfile
+  when: "'/opt/swapfile' not in active_swap.stdout"
+
+- name: Add swap file to /etc/fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: "/opt/swapfile swap swap defaults 0 0"
+    state: present
+
+- name: Activate swap file
+  ansible.builtin.command: swapon /opt/swapfile
+  when: "'/opt/swapfile' not in active_swap.stdout"
+  register: swapon_result
+  changed_when: swapon_result.rc == 0
+  failed_when: false

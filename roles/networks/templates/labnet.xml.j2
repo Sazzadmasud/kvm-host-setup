@@ -1,4 +1,4 @@
-<network>
+<network xmlns:dnsmasq='http://libvirt.org/schemas/network/dnsmasq/1.0'>
   <name>{{ ocp_network_name }}</name>
   <forward mode='nat'>
     <nat>
@@ -6,25 +6,8 @@
     </nat>
   </forward>
   <bridge name='{{ ocp_network_bridge }}' stp='on' delay='0'/>
-  <dns>
-    <!-- API and Ingress VIP DNS entries -->
-    <host ip='{{ api_vip }}'>
-      <hostname>api.{{ cluster_name }}.{{ base_domain }}</hostname>
-      <hostname>api-int.{{ cluster_name }}.{{ base_domain }}</hostname>
-    </host>
-    <host ip='{{ ingress_vip }}'>
-      <hostname>oauth-openshift.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
-      <hostname>console-openshift-console.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
-      <hostname>grafana-openshift-monitoring.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
-      <hostname>prometheus-k8s-openshift-monitoring.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
-      <hostname>alertmanager-main-openshift-monitoring.apps.{{ cluster_name }}.{{ base_domain }}</hostname>
-    </host>
-    {% for node in control_nodes + worker_nodes %}
-    <host ip='{{ node.ip }}'>
-      <hostname>{{ node.name }}.{{ cluster_name }}.{{ base_domain }}</hostname>
-    </host>
-    {% endfor %}
-  </dns>
+  <!-- DNS disabled: BIND9 on the host handles all DNS on {{ ocp_network_gateway }}:53 -->
+  <dns enable='no'/>
   <ip address='{{ ocp_network_gateway }}' netmask='{{ ocp_network_netmask }}'>
     <dhcp>
       <range start='{{ ocp_network_dhcp_start }}' end='{{ ocp_network_dhcp_end }}'/>
@@ -33,4 +16,8 @@
       {% endfor %}
     </dhcp>
   </ip>
+  <!-- Tell DHCP clients to use BIND on the gateway for DNS -->
+  <dnsmasq:options>
+    <dnsmasq:option value='dhcp-option=option:dns-server,{{ ocp_network_gateway }}'/>
+  </dnsmasq:options>
 </network>

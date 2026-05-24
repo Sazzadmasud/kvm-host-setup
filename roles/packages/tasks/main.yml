@@ -20,6 +20,7 @@
       - ansible-core
       # Networking tools
       - dnsmasq
+      - bind
       - bind-utils
       - nmap
       - nmstate

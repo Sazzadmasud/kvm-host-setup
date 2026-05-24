@@ -1,0 +1,60 @@
+---
+- name: Install BIND
+  ansible.builtin.dnf:
+    name:
+      - bind
+      - bind-utils
+    state: present
+
+- name: Create systemd override dir for named
+  ansible.builtin.file:
+    path: /etc/systemd/system/named.service.d
+    state: directory
+    mode: "0755"
+
+- name: Override named.service — start after libvirtd, auto-restart
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/named.service.d/after-libvirt.conf
+    content: |
+      [Unit]
+      After=libvirtd.service
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+    mode: "0644"
+  notify:
+    - systemd daemon-reload
+    - restart named
+
+- name: Deploy named.conf
+  ansible.builtin.template:
+    src: named.conf.j2
+    dest: /etc/named.conf
+    owner: root
+    group: named
+    mode: "0640"
+  notify: restart named
+
+- name: Deploy ocp zone file
+  ansible.builtin.template:
+    src: ocp.lab.local.zone.j2
+    dest: /var/named/ocp.lab.local.zone
+    owner: root
+    group: named
+    mode: "0640"
+  notify: reload named
+
+- name: Allow DNS in libvirt firewalld zone (for VMs querying BIND on virbr4)
+  ansible.posix.firewalld:
+    zone: libvirt
+    service: dns
+    state: enabled
+    permanent: true
+    immediate: true
+
+- name: Enable and start named
+  ansible.builtin.service:
+    name: named
+    enabled: true
+    state: started

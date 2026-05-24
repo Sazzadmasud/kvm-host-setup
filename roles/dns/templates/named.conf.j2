@@ -1,0 +1,41 @@
+// BIND9 configuration for OCP lab
+// Managed by Ansible — do not edit manually
+
+options {
+    // Port 53 on virbr4 for VM queries
+    // Port 5353 on localhost for NM-dnsmasq forwarding (host queries)
+    // 127.0.0.1:53 is reserved for NetworkManager's own dnsmasq
+    listen-on port 53 { {{ ocp_network_gateway }}; };
+    listen-on port 5353 { 127.0.0.1; };
+    listen-on-v6 { none; };
+
+    directory "/var/named";
+    dump-file "/var/named/data/cache_dump.db";
+    statistics-file "/var/named/data/named_stats.txt";
+
+    allow-query { {{ ocp_network_cidr }}; 127.0.0.0/8; };
+    allow-recursion { {{ ocp_network_cidr }}; 127.0.0.0/8; };
+    recursion yes;
+
+    // Forward non-local queries to real resolvers
+    forwarders { 8.8.8.8; 8.8.4.4; };
+    forward only;
+
+    dnssec-validation no;
+    minimal-any yes;
+};
+
+logging {
+    channel default_log {
+        file "/var/named/data/named.log" versions 3 size 5m;
+        severity dynamic;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+
+zone "{{ cluster_name }}.{{ base_domain }}" IN {
+    type primary;
+    file "/var/named/{{ cluster_name }}.{{ base_domain }}.zone";
+    allow-update { none; };
+};
