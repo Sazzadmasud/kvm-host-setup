@@ -20,25 +20,19 @@ trap 'rm -rf "$COORD_DIR"' EXIT
 elapsed=0
 
 eject_vm() {
-    local vm=$1 live=$2
-
-    if [[ "$live" == yes ]]; then
-        # Try live+persistent eject while VM is running
-        if virsh -c qemu:///system change-media "$vm" sda --eject --live --config 2>/dev/null; then
-            echo "[$(date +%T)] $vm: ISO ejected (live)"
-            touch "$COORD_DIR/$vm"
-            return
-        fi
-        # Live eject failed (common with SATA CDROMs) — fall through to config-only.
-        # Config-only removes the ISO from persistent XML so the node won't boot from
-        # the ISO after it reboots naturally following the image write.
-        echo "[$(date +%T)] $vm: live eject failed — applying config-only eject"
-    fi
-
+    local vm=$1
+    # Always config-only — never eject while the VM is running.
+    # --live disconnects the ISO from the running guest, which triggers the
+    # agent's media-connected validation to fail, putting the host (and the
+    # entire cluster) into error state and halting all remaining installs.
+    # --config alone removes the ISO source from the persistent XML so that
+    # after the post-write reboot UEFI sees an empty CDROM, falls through to
+    # boot order 2 (vda), and the node boots into RHCOS. The running agent
+    # never observes a disconnect.
     if virsh -c qemu:///system change-media "$vm" sda --eject --config 2>/dev/null; then
-        echo "[$(date +%T)] $vm: ISO removed from persistent config (takes effect on reboot)"
+        echo "[$(date +%T)] $vm: ISO removed from persistent XML (node will boot from disk on reboot)"
     else
-        echo "[$(date +%T)] $vm: WARNING — eject failed entirely; node may reboot from ISO"
+        echo "[$(date +%T)] $vm: WARNING — config eject failed; node may reboot from ISO"
     fi
     touch "$COORD_DIR/$vm"
 }
@@ -63,14 +57,14 @@ while [[ $elapsed -lt $timeout ]]; do
         case "$state" in
             shutoff|inshutdown)
                 echo "[$(date +%T)] $vm is $state — post-write reboot detected"
-                eject_vm "$vm" no
+                eject_vm "$vm"
                 ;;
             running)
                 if grep -qiE \
                     "Host:[[:space:]]+${vm}[^,]*,.*(Writing image.*100|Rebooting)" \
                     "$LOG" 2>/dev/null; then
                     echo "[$(date +%T)] $vm: image-write complete (log signal)"
-                    eject_vm "$vm" yes
+                    eject_vm "$vm"
                 fi
                 ;;
             paused|suspended)
@@ -91,9 +85,7 @@ done
 echo "WARNING: monitor timed out after ${timeout}s — force-ejecting remaining nodes."
 for vm in "${all_vms[@]}"; do
     [[ -f "$COORD_DIR/$vm" ]] && continue
-    state=$(virsh -c qemu:///system domstate "$vm" 2>/dev/null | tr -d ' \n')
-    [[ "$state" == "running" ]] && live=yes || live=no
-    eject_vm "$vm" "$live"
+    eject_vm "$vm"
 done
 echo "Force-eject complete."
 {% endraw %}
