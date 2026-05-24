@@ -1,7 +1,35 @@
 # KVM Host Setup for OCP 4.18 (Agent-based)
 
-Ansible playbooks to clean and configure a bare-metal KVM host, then deploy
-OpenShift Container Platform 4.18 using the agent-based installation method.
+Ansible playbooks to configure a bare-metal KVM host and deploy OpenShift
+Container Platform 4.18 using the agent-based installation method.
+
+---
+
+## Table of Contents
+
+1. [Host Specifications](#host-specifications)
+2. [Cluster Design](#cluster-design)
+3. [Architecture Overview](#architecture-overview)
+4. [Part 1 — Prerequisites](#part-1--prerequisites)
+   - [1.1 Host Hardware Verification](#11-host-hardware-verification)
+   - [1.2 KVM / libvirt Stack](#12-kvm--libvirt-stack)
+   - [1.3 Swap — Why 32 GB and Where](#13-swap--why-32-gb-and-where)
+   - [1.4 DNS — BIND9 (not libvirt dnsmasq)](#14-dns--bind9-not-libvirt-dnsmasq)
+   - [1.5 Load Balancer — HAProxy with Persistent VIPs](#15-load-balancer--haproxy-with-persistent-vips)
+   - [1.6 NetworkManager DNS Forwarding](#16-networkmanager-dns-forwarding)
+   - [1.7 Libvirt Network (DHCP only, DNS off)](#17-libvirt-network-dhcp-only-dns-off)
+5. [Part 2 — OCP Deployment](#part-2--ocp-deployment)
+   - [2.1 Wipe Everything](#21-wipe-everything)
+   - [2.2 Run Full Host Setup](#22-run-full-host-setup)
+   - [2.3 Add Your Pull Secret](#23-add-your-pull-secret)
+   - [2.4 Generate the Agent ISO](#24-generate-the-agent-iso)
+   - [2.5 Start VMs](#25-start-vms)
+   - [2.6 Monitor Bootstrap + Eject ISO](#26-monitor-bootstrap--eject-iso)
+   - [2.7 Wait for Install Complete](#27-wait-for-install-complete)
+   - [2.8 Access the Cluster](#28-access-the-cluster)
+6. [Customisation](#customisation)
+7. [Project Structure](#project-structure)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -9,14 +37,13 @@ OpenShift Container Platform 4.18 using the agent-based installation method.
 
 | Property | Value |
 |---|---|
-| OS | Fedora Linux 42 (Workstation) |
+| OS | Fedora Linux 42 |
 | Kernel | 6.19.8-100.fc42.x86_64 |
 | CPU | Intel Core i7-10710U — 6 cores / 12 threads, VT-x |
-| RAM | 62 GB (8 GB swap) |
+| RAM | 62 GB |
 | Root disk | NVMe 29 GB (btrfs, `/` + `/home`) |
 | Data disk | `/dev/sda1` ext4 733 GB → `/opt` |
-| KVM stack | qemu-kvm 9.2.4, libvirt 11.0.0 (modular daemons) |
-| SELinux | permissive (config: enforcing) |
+| KVM stack | qemu-kvm, libvirt (modular daemons) |
 
 ---
 
@@ -32,6 +59,11 @@ OpenShift Container Platform 4.18 using the agent-based installation method.
 | ocp-worker-1  | worker | 4 |  8 GB | 120 GB | `52:54:00:c0:02:01` | 192.168.200.31 |
 | ocp-worker-2  | worker | 4 |  8 GB | 120 GB | `52:54:00:c0:02:02` | 192.168.200.32 |
 
+**Total VM allocation:** 3×16 + 2×8 = 64 GB on a 62 GB host. This is a
+deliberate overcommit — Linux's memory overcommit + zram + the 32 GB swapfile
+on `/opt` make it work in practice for a lab. The VMs don't all actively use
+their full allocation simultaneously during stable operation.
+
 ### Network
 
 | Purpose | Value |
@@ -40,172 +72,615 @@ OpenShift Container Platform 4.18 using the agent-based installation method.
 | Bridge | `virbr4` |
 | Mode | NAT |
 | Subnet | 192.168.200.0/24 |
-| Gateway / DNS | 192.168.200.1 (libvirt dnsmasq) |
-| DHCP range | 192.168.200.100–200 |
-| API VIP | 192.168.200.10 |
-| Ingress VIP | 192.168.200.11 |
+| Gateway | 192.168.200.1 |
+| DHCP range | 192.168.200.100–200 (nodes use static IPs, range for ad-hoc VMs) |
+| API VIP | 192.168.200.10 → `api.ocp.lab.local`, `api-int.ocp.lab.local` |
+| Ingress VIP | 192.168.200.11 → `*.apps.ocp.lab.local` |
 | Cluster domain | `ocp.lab.local` |
 
-DNS is handled by libvirt's built-in dnsmasq on `virbr4`, with a NetworkManager
-stub zone forwarding `*.ocp.lab.local` to `192.168.200.1` on the host.
-
 ---
 
-## Project Structure
+## Architecture Overview
 
 ```
-kvm-host-setup/
-├── ansible.cfg                        # Inventory path, become, callbacks
-├── inventory/
-│   └── hosts.yml                      # Single host: localhost (local connection)
-├── group_vars/
-│   └── all.yml                        # All variables — edit this first
-│
-├── roles/
-│   ├── cleanup/tasks/main.yml         # Destroy VMs, networks, pools; wipe dirs
-│   ├── packages/tasks/main.yml        # dnf + openshift-install + oc downloads
-│   ├── libvirt_setup/tasks/main.yml   # Modular daemons, qemu.conf, groups, sysctl
-│   ├── networks/tasks/main.yml        # Define labnet + DNS/hosts config
-│   ├── haproxy/tasks/main.yml         # HAProxy LB config + VIP assignment to virbr4
-│   ├── storage_pool/tasks/main.yml    # /opt/images pool
-│   └── vms/tasks/main.yml            # Disk images + VM XML definitions
-│
-├── ocp-config/
-│   ├── install-config.yaml.j2         # OCP install-config template
-│   └── agent-config.yaml.j2          # Per-node NMState static IP config
-│
-├── site.yml                           # Full host setup playbook
-├── cleanup.yml                        # Wipe-only playbook (with confirmation)
-└── generate-ocp-config.yml           # Render configs + run openshift-install
+┌─────────────────────────────────────────────────────────────────┐
+│  KVM Host (Fedora 42, 62 GB RAM)                                │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  virbr4  192.168.200.1/24                               │   │
+│  │          192.168.200.10/32  (API VIP)                   │   │
+│  │          192.168.200.11/32  (Ingress VIP)               │   │
+│  │                                                         │   │
+│  │  BIND9  :53   (for VMs)    :5353  (for host NM fwd)     │   │
+│  │  HAProxy :6443 :22623 :80 :443  (bound to VIPs)         │   │
+│  │  dnsmasq :67  DHCP only — DNS disabled                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│          │ vnet1   │ vnet3   │ vnet4   │ vnet5   │ vnet6        │
+│          ▼         ▼         ▼         ▼         ▼              │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────┐     │
+│  │control-1 │ │control-2 │ │control-3 │ │wkr-1 │ │wkr-2 │     │
+│  │.21       │ │.22       │ │.23       │ │.31   │ │.32   │     │
+│  └──────────┘ └──────────┘ └──────────┘ └──────┘ └──────┘     │
+│                                                                 │
+│  Host DNS query path:                                           │
+│    app → NM dnsmasq (127.0.0.1:53)                              │
+│         → ocp.lab.local? forward to BIND (127.0.0.1:5353)      │
+│         → other? forward to internet                            │
+│                                                                 │
+│  VM DNS query path:                                             │
+│    VM → BIND (192.168.200.1:53) — direct, no proxy             │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Prerequisites
+## Part 1 — Prerequisites
 
-1. **Fedora 42** with `qemu-kvm` and `libvirt` already installed
-   (`ansible-core` is installed by the `packages` role).
-2. **Pull secret** from [console.redhat.com](https://console.redhat.com/openshift/install/pull-secret).
-3. **SSH key pair** at `~/.ssh/id_rsa` (generated automatically if missing).
-4. `/opt` mounted on a large disk (≥ 500 GB free).
+This section explains **what the Ansible roles configure and why** before any
+OCP deployment begins. Running `ansible-playbook site.yml` (excluding `--tags
+vms`) sets all of this up automatically.
 
 ---
 
-## Step-by-Step Deployment
+### 1.1 Host Hardware Verification
 
-### 1 — Wipe the existing environment
+**Role:** `pre_tasks` in `site.yml`
 
-Destroys all running VMs, undefines networks and storage pools, wipes
-`/opt/images`, `/opt/ocp`, `/opt/ocp-build`, `/opt/ocp-lab`, cleans the dnf
-cache, vacuums the systemd journal, and prunes Docker.
+Before anything runs, the playbook asserts:
+
+- **KVM support**: `/proc/cpuinfo` must contain `vmx` (Intel VT-x) or `svm`
+  (AMD-V). Without hardware virtualisation OCP nodes cannot boot.
+- **Minimum RAM**: 48 GB. The cluster needs 64 GB allocated across 5 VMs;
+  the host needs to support that with overcommit.
+- **`/opt` space**: Minimum 500 GB free. VM disk images (5 × 120 GB = 600 GB
+  nominal, ~10–20 GB actual on thin-provisioned qcow2), the agent ISO (~1.4 GB),
+  the 32 GB swapfile, and install artifacts all live here.
+
+---
+
+### 1.2 KVM / libvirt Stack
+
+**Role:** `packages`, `libvirt_setup`
+
+**What is installed:**
+
+```
+qemu-kvm  qemu-img  libvirt  libvirt-client
+libvirt-daemon-driver-{qemu,network,storage-core,storage-logical}
+virt-install  python3-libvirt  python3-lxml
+bind  bind-utils  dnsmasq  haproxy  nmstate
+openshift-install  oc  kubectl
+```
+
+**Fedora 42 uses modular libvirt daemons.** Fedora 38+ replaced the
+single `libvirtd` process with socket-activated micro-daemons. The sockets
+that must be enabled are:
+
+| Socket | Purpose |
+|---|---|
+| `virtqemud.socket` | QEMU hypervisor driver |
+| `virtnetworkd.socket` | Network (bridge, NAT, DNS/DHCP) |
+| `virtstoraged.socket` | Storage pool management |
+| `virtnodedevd.socket` | Host device enumeration |
+| `virtsecretd.socket` | Secrets (used by LUKS) |
+| `virtlogd.socket` | Console log forwarding |
+
+If only `libvirtd.socket` is enabled (the old monolithic path), `virsh
+-c qemu:///system` may work but `virtnetworkd` won't be managing networks,
+causing stale PID files and bridge conflicts on cleanup. See [T4](#t4).
+
+**QEMU configuration changes** (`/etc/libvirt/qemu.conf`):
+
+| Setting | Value | Reason |
+|---|---|---|
+| `security_driver` | `none` | Disables sVirt/SELinux labelling — simplifies lab setup |
+| `user` | `root` | Needed to read qcow2 images in `/opt/images` |
+| `group` | `kvm` | Shared access to KVM device nodes |
+| `dynamic_ownership` | `1` | QEMU can chown disk images at runtime |
+
+---
+
+### 1.3 Swap — Why 32 GB and Where
+
+**Role:** `swap`
+
+**The problem:** The 5 VMs collectively allocate 64 GB of RAM on a 62 GB
+host. Without sufficient swap, any mmap that the kernel cannot back with
+physical pages causes a `SIGSEGV` (exit 139) inside the guest process — not an
+OOM kill, just a silent crash. This was observed as `openshift-apiserver`
+crashing on control-3 with exit code 139 during the initial install attempt.
+
+**The solution:** A 32 GB swapfile on `/opt` (which has 529 GB free on the
+data SSD). The host also has an 8 GB zram swap device (priority 100, used
+first due to compression). Combined, the host has ~40 GB of swap, enough
+headroom for the overcommit.
+
+**What the role does:**
+
+1. Creates `/opt/swapfile` (32 GB, `dd` if it doesn't exist)
+2. Formats it as swap (`mkswap`)
+3. Activates it (`swapon`)
+4. Adds it to `/etc/fstab` for persistence across reboots:
+   ```
+   /opt/swapfile swap swap defaults 0 0
+   ```
+
+**Why `/opt` and not `/`?** The root NVMe partition is only 29 GB (btrfs).
+`/opt` is on the 733 GB data SSD with over 500 GB free.
+
+---
+
+### 1.4 DNS — BIND9 (not libvirt dnsmasq)
+
+**Role:** `dns`, `nm_dns`
+
+This is the most important prerequisite to get right. DNS problems cause
+cascading failures in OCP that are very difficult to diagnose.
+
+#### Why not libvirt's built-in dnsmasq?
+
+libvirt's dnsmasq is sufficient for basic A record resolution. The problems
+appear when OCP is running:
+
+**Problem: AAAA query loop causing timeouts**
+
+OCP pods run with `ndots:5` in their `/etc/resolv.conf`. This makes the Go
+HTTP client (used by almost every OCP operator) issue both A and AAAA queries
+for every hostname. When AAAA queries hit libvirt's dnsmasq, the following
+loop forms:
+
+```
+Pod DNS query: oauth-openshift.apps.ocp.lab.local AAAA
+  → CoreDNS (on node) → forwards to node resolver (192.168.200.1)
+  → libvirt dnsmasq → doesn't have AAAA, forwards upstream → 127.0.0.1
+  → NM dnsmasq → server=/ocp.lab.local/192.168.200.1 → back to libvirt dnsmasq
+  → loop → timeout after 5 seconds
+```
+
+The `filter-AAAA` dnsmasq option was tried but it only suppresses forwarding
+to the *default* upstream resolver. It does **not** suppress forwarding to
+domain-specific `server=` entries — so the loop persists for all
+`*.ocp.lab.local` names.
+
+`local=/ocp.lab.local/` (mark the domain as locally authoritative, never
+forward) was also tried. This requires a full daemon restart to take effect
+(SIGHUP only re-reads hosts files, not the main config), and restarting the
+libvirt dnsmasq while VMs are running is disruptive.
+
+**The fix: BIND9**
+
+BIND9 is authoritative for `ocp.lab.local`. It returns `NXDOMAIN` instantly
+for unknown names (no forwarding to any upstream), and returns `NOERROR` with
+empty answer section for AAAA queries against A-only names. No loops, no
+timeouts.
+
+#### What BIND9 serves
+
+Zone: `ocp.lab.local`
+
+| Name | Type | Value |
+|---|---|---|
+| `api.ocp.lab.local` | A | 192.168.200.10 (API VIP) |
+| `api-int.ocp.lab.local` | A | 192.168.200.10 (same VIP, internal alias) |
+| `*.apps.ocp.lab.local` | A | 192.168.200.11 (Ingress VIP, wildcard) |
+| `ocp-control-{1,2,3}.ocp.lab.local` | A | 192.168.200.{21,22,23} |
+| `ocp-worker-{1,2}.ocp.lab.local` | A | 192.168.200.{31,32} |
+
+**`api-int` is critical.** During first boot, RHCOS fetches its ignition
+config from `https://api-int.ocp.lab.local:22623/config/master`. If this name
+doesn't resolve, ignition fails silently — the node boots with no SSH keys,
+no kubelet, and can never join the cluster. See [T11](#t11).
+
+#### How BIND9 listens
+
+BIND9 listens on two addresses and two ports:
+
+| Address:Port | Purpose |
+|---|---|
+| `192.168.200.1:53` | Direct DNS for all VMs (DHCP tells VMs to use this) |
+| `127.0.0.1:5353` | For NM dnsmasq to forward `*.ocp.lab.local` from the host |
+
+`127.0.0.1:53` is **not** used by BIND9 — that port belongs to NM's own
+dnsmasq process.
+
+#### Startup order
+
+BIND9 must start *after* `virbr4` exists (otherwise it cannot bind to
+`192.168.200.1:53`). The `dns` role adds a systemd drop-in:
+
+```ini
+# /etc/systemd/system/named.service.d/after-libvirt.conf
+[Unit]
+After=libvirtd.service
+
+[Service]
+Restart=on-failure
+RestartSec=5
+```
+
+The libvirt network hook (see §1.5) also calls `systemctl restart named`
+after binding VIPs, as a belt-and-suspenders measure.
+
+---
+
+### 1.5 Load Balancer — HAProxy with Persistent VIPs
+
+**Role:** `haproxy`, `vip`
+
+#### What HAProxy does
+
+HAProxy load-balances four services:
+
+| Frontend | VIP:Port | Backend |
+|---|---|---|
+| API server | 192.168.200.10:6443 | control-{1,2,3}:6443 |
+| Machine Config | 192.168.200.10:22623 | control-{1,2,3}:22623 |
+| Ingress HTTP | 192.168.200.11:80 | worker-{1,2}:80 |
+| Ingress HTTPS | 192.168.200.11:443 | worker-{1,2}:443 |
+
+HAProxy runs on the KVM host (not in a VM). It binds to the specific VIP
+addresses, not `*:port`. This prevents port conflicts with other host services
+and makes the binding intent explicit.
+
+#### Why VIPs must be explicitly assigned to virbr4
+
+A VM sending a packet to `192.168.200.10` does a broadcast ARP request:
+*"Who has 192.168.200.10?"* If no interface on the host has that address, the
+ARP goes unanswered, the VM never gets a MAC address for the gateway, and the
+TCP connection never establishes — even though HAProxy is listening.
+
+The VIPs must be secondary addresses on `virbr4` so the host responds to ARP
+and HAProxy receives the traffic.
+
+#### How VIPs are made persistent (libvirt network hook)
+
+Previous attempts used:
+- Manual `ip addr add` — lost on reboot
+- NetworkManager dispatcher script — does not fire for `virbr*` interfaces
+  (NM explicitly ignores them via the `99-libvirt.conf` unmanaged-devices rule)
+
+The correct mechanism is a **libvirt network hook**:
+`/etc/libvirt/hooks/network`
+
+Libvirt calls this script every time any network changes state. The hook binds
+the VIPs when `labnet` starts and removes them when it stops:
+
+```bash
+case "$NETWORK/$ACTION" in
+    labnet/started)
+        ip addr add 192.168.200.10/32 dev virbr4
+        ip addr add 192.168.200.11/32 dev virbr4
+        sleep 1
+        systemctl restart named   # BIND can now bind to 192.168.200.1:53
+        ;;
+    labnet/stopped)
+        ip addr del 192.168.200.10/32 dev virbr4
+        ip addr del 192.168.200.11/32 dev virbr4
+        ;;
+esac
+```
+
+This runs automatically on every boot when libvirtd autostart brings up
+`labnet`. No manual intervention needed.
+
+#### HAProxy startup order
+
+HAProxy binds to the VIPs. The VIPs only exist after the libvirt hook runs.
+The `haproxy` role adds a systemd drop-in:
+
+```ini
+# /etc/systemd/system/haproxy.service.d/after-libvirt.conf
+[Unit]
+After=libvirtd.service
+
+[Service]
+Restart=on-failure
+RestartSec=5
+```
+
+If HAProxy starts before the hook finishes, it restarts automatically and
+succeeds on the next attempt.
+
+---
+
+### 1.6 NetworkManager DNS Forwarding
+
+**Role:** `nm_dns`
+
+The KVM host uses NetworkManager with dnsmasq mode for its own DNS resolution
+(`/etc/NetworkManager/conf.d/01-dnsmasq.conf`). NM dnsmasq runs on
+`127.0.0.1:53` and handles all host DNS queries.
+
+For OCP names, NM dnsmasq needs to forward to BIND9. The config
+`/etc/NetworkManager/dnsmasq.d/ocp.conf` contains:
+
+```
+server=/ocp.lab.local/127.0.0.1#5353
+```
+
+This forwards all `*.ocp.lab.local` queries (including `*.apps.ocp.lab.local`
+which is a subdomain) to BIND9 on port 5353. BIND9 answers authoritatively —
+no further forwarding, no loops.
+
+External names (internet) are forwarded by NM dnsmasq to the upstream
+resolver from the active network connection (wifi in this case).
+
+---
+
+### 1.7 Libvirt Network (DHCP only, DNS off)
+
+**Role:** `networks`
+
+The `labnet` network definition has DNS **disabled**:
+
+```xml
+<dns enable='no'/>
+```
+
+Without this, libvirt's dnsmasq would bind to `192.168.200.1:53` and prevent
+BIND9 from binding there. With DNS disabled, dnsmasq only handles DHCP.
+
+VMs are told to use BIND9 for DNS via a DHCP option:
+
+```xml
+<dnsmasq:options>
+  <dnsmasq:option value='dhcp-option=option:dns-server,192.168.200.1'/>
+</dnsmasq:options>
+```
+
+This injects `option 6` (DNS server) into every DHCP offer, overriding the
+default (which would be the gateway itself acting as DNS). VMs receive their
+IP from DHCP but query BIND9 directly for all DNS.
+
+Note: OCP node IPs are static (configured via NMState in `agent-config.yaml`),
+not from DHCP. The DHCP option is still sent in the DISCOVER/OFFER exchange;
+NMState picks it up and writes it to the node's `resolv.conf`.
+
+---
+
+## Part 2 — OCP Deployment
+
+With all prerequisites in place (either from a fresh `site.yml` run or
+verified manually), follow these steps in order.
+
+---
+
+### 2.1 Wipe Everything
+
+If there is a previous install (VMs, networks, images) that needs to be
+removed first:
 
 ```bash
 cd /opt/kvm-host-setup
 ansible-playbook cleanup.yml
 ```
 
-### 2 — Set up the KVM host
+This destroys and undefines all VMs (with `--nvram --remove-all-storage`),
+destroys and undefines all libvirt networks and storage pools, kills any stale
+dnsmasq processes left by the old monolithic libvirtd, removes stale bridge
+and tap interfaces, wipes `/opt/images`, `/opt/ocp`, and `/opt/ocp-build`,
+vacuums the systemd journal to 200 MB, and cleans the dnf cache.
 
-Installs packages, configures libvirt modular daemons, defines the `labnet`
-network, creates the `/opt/images` storage pool, and creates VM disk images +
-XML definitions (VMs are **not** started yet — the agent ISO doesn't exist yet).
+**Warning:** This removes everything including all VM disk data. There is no
+confirmation prompt — run it only when you mean it.
+
+---
+
+### 2.2 Run Full Host Setup
 
 ```bash
-ansible-playbook site.yml
+ansible-playbook site.yml --skip-tags vms
 ```
 
-You can target individual roles with tags:
+This configures the entire host in order:
+
+1. **packages** — installs KVM stack, BIND, HAProxy, nmstate, openshift-install, oc
+2. **swap** — creates and activates the 32 GB swapfile, adds to fstab
+3. **libvirt_setup** — enables modular daemons, configures qemu.conf
+4. **networks** — defines `labnet` (NAT, DNS off, DHCP with DNS option)
+5. **dns** — deploys named.conf + zone file, opens libvirt firewalld zone for DNS
+6. **nm_dns** — writes NM dnsmasq forwarding config for `ocp.lab.local`
+7. **vip** — deploys the libvirt network hook, binds VIPs immediately
+8. **haproxy** — deploys haproxy.cfg, opens firewalld ports, enables service
+9. **storage_pool** — creates `/opt/images` storage pool in libvirt
+
+Individual roles can be re-run with tags:
 
 ```bash
-ansible-playbook site.yml --tags packages
-ansible-playbook site.yml --tags libvirt
-ansible-playbook site.yml --tags networks
-ansible-playbook site.yml --tags storage
-ansible-playbook site.yml --tags vms
+ansible-playbook site.yml --tags dns          # re-deploy BIND config only
+ansible-playbook site.yml --tags haproxy      # re-deploy HAProxy config only
+ansible-playbook site.yml --tags networks     # re-define labnet
 ```
 
-### 3 — Add your pull secret
+**Verify the prerequisites before continuing:**
+
+```bash
+# BIND is running and serving all required names
+dig api.ocp.lab.local A +short           # → 192.168.200.10
+dig api-int.ocp.lab.local A +short       # → 192.168.200.10
+dig ocp-control-1.ocp.lab.local A +short # → 192.168.200.21
+dig anything.apps.ocp.lab.local A +short # → 192.168.200.11
+
+# AAAA queries return immediately (no timeout)
+dig api.ocp.lab.local AAAA +time=2       # → NOERROR, empty answer
+dig foo.ocp.lab.local AAAA +time=2       # → NXDOMAIN
+
+# VIPs are on virbr4
+ip addr show virbr4 | grep '192.168.200.1[01]'
+
+# HAProxy is running and config is valid
+haproxy -c -f /etc/haproxy/haproxy.cfg && echo "config OK"
+systemctl is-active haproxy
+
+# Swap is active and in fstab
+swapon --show
+grep swapfile /etc/fstab
+```
+
+---
+
+### 2.3 Add Your Pull Secret
+
+Download your pull secret from
+[console.redhat.com/openshift/install/pull-secret](https://console.redhat.com/openshift/install/pull-secret)
+and copy it to the expected location:
 
 ```bash
 cp ~/pull-secret.json /opt/ocp/pull-secret.json
 chmod 600 /opt/ocp/pull-secret.json
+
+# Verify it is valid JSON with the correct keys
+python3 -c "
+import json
+ps = json.load(open('/opt/ocp/pull-secret.json'))
+print('Keys:', list(ps['auths'].keys()))
+"
 ```
 
-### 4 — Generate the agent ISO
+Expected output:
+```
+Keys: ['cloud.openshift.com', 'quay.io', 'registry.connect.redhat.com', 'registry.redhat.io']
+```
 
-Renders `install-config.yaml` and `agent-config.yaml` from templates, then
-calls `openshift-install agent create image` to produce `agent.x86_64.iso`.
+---
+
+### 2.4 Generate the Agent ISO
+
+This renders `install-config.yaml` and `agent-config.yaml` from Jinja2
+templates (using variables from `group_vars/all.yml`), then calls
+`openshift-install agent create image` to produce the boot ISO.
 
 ```bash
 ansible-playbook generate-ocp-config.yml
 ```
 
-To override variables inline:
+The ISO is written to `/opt/ocp/cluster/agent.x86_64.iso` (~1.4 GB).
+`openshift-install` also writes a `auth/` directory with the kubeconfig and
+kubeadmin password.
 
+To override variables without editing `all.yml`:
 ```bash
 ansible-playbook generate-ocp-config.yml \
   -e "cluster_name=mycluster base_domain=example.com"
 ```
 
-### 5 — Start the VMs
+**What the ISO contains:**
 
-The `vms` role detects the ISO and boots all nodes.
+- A minimal RHCOS (Red Hat CoreOS) live image
+- Embedded `install-config.yaml` and `agent-config.yaml`
+- NMState network configuration (static IPs, DNS, routes) for every node
+- Ignition config pre-staged for first-boot
+
+All 5 VMs boot the **same** ISO. The agent-service on each node reads the
+embedded config, matches the node's MAC address to determine its role and IP,
+and configures itself accordingly. The first node to boot (`ocp-control-1`
+at `192.168.200.21`, the `rendezvousIP`) hosts the bootstrap cluster until
+etcd quorum is established.
+
+---
+
+### 2.5 Start VMs
 
 ```bash
 ansible-playbook site.yml --tags vms
 ```
 
-### 6 — Eject ISO and wait for bootstrap-complete
+The `vms` role creates 120 GB thin-provisioned qcow2 disk images in
+`/opt/images/`, defines VM XML with the correct MAC addresses and ISO attached
+as boot device, and starts all 5 VMs.
 
-Run this immediately after starting the VMs. It does three things
-automatically:
+VM disk performance note: the XML template uses `cache='unsafe' io='threads'`
+for the disk. This makes guest `fdatasync` calls a no-op on the host, which is
+required for the RHCOS `installation-disk-speed-check` to pass. The fio test
+that OCP runs (`fio --rw=write --ioengine=sync --fdatasync=1`) fails with
+`cache='none'` (too slow) and `cache='writeback'` (passes first round, fails
+subsequent rounds as HDD contention builds). See [T8](#t8).
 
-1. Starts `openshift-install agent wait-for bootstrap-complete` in the
-   background (so the install log is live).
-2. Watches each node for RHCOS image-write completion — via two parallel
-   signals: the install log (`Writing image.*100` / `Rebooting`) and the
-   virsh domain state (`shut off` = node just rebooted after write).
-3. Ejects the ISO from each node the moment its disk write is done, before
-   the post-write reboot can boot back into the installer.
+---
 
-UEFI NVRAM on KVM does not reliably honour the XML boot-order override;
-leaving the ISO attached causes nodes to reboot back into the installer
-instead of the disk, stalling the install with:
+### 2.6 Monitor Bootstrap + Eject ISO
 
-```
-Expected the host to boot from disk, but it booted the installation image
-```
+Run this **immediately after starting the VMs**, in a separate terminal:
 
 ```bash
 ansible-playbook eject-iso.yml
 ```
 
-The playbook exits once bootstrap-complete is reached (~15–20 min). If a
-node somehow boots back into the ISO before the playbook catches it, eject
-and reboot manually:
+This playbook does two things in parallel:
 
+1. **Starts `openshift-install agent wait-for bootstrap-complete`** — so the
+   install log is streaming and the playbook exits cleanly when bootstrap is
+   reached.
+
+2. **Monitors each VM and ejects the agent ISO** the moment RHCOS finishes
+   writing itself to disk. Detection uses two parallel signals (first one wins
+   per node):
+   - The install log matches `Host: <name>.*Writing image.*100` or
+     `Host: <name>.*Rebooting`
+   - The virsh domain state transitions to `shut-off` (post-write reboot)
+
+**Why ejecting is necessary:** After RHCOS writes to disk, the node reboots.
+On UEFI KVM VMs, the boot order in XML is not reliably honoured — the VM can
+boot from the ISO again instead of the disk. This causes:
+```
+Expected the host to boot from disk, but it booted the installation image
+```
+…and the install stalls. Ejecting the ISO before the reboot forces disk boot.
+
+If a node does accidentally reboot into the ISO before ejection, recover
+manually:
 ```bash
-sudo virsh -c qemu:///system change-media <vm> sda --eject --live --config
-sudo virsh -c qemu:///system reboot <vm>
+sudo virsh -c qemu:///system change-media ocp-control-1 sda --eject --live --config
+sudo virsh -c qemu:///system reboot ocp-control-1
 ```
 
-### 7 — Wait for full install to complete
+Bootstrap completes in approximately 15–20 minutes after VM start.
+
+---
+
+### 2.7 Wait for Install Complete
+
+After bootstrap-complete is logged, run:
 
 ```bash
-# (~45 min total from VM start)
 openshift-install --dir=/opt/ocp/cluster agent wait-for install-complete \
   --log-level=info
 ```
 
-### 8 — Access the cluster
+This waits for all cluster operators to become available and the cluster
+version to report `Completed`. Total time from VM start is approximately
+45–60 minutes.
+
+While waiting, you can watch operator status:
+```bash
+export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
+watch -n10 "oc get co | grep -v 'True.*False.*False'"
+```
+
+A healthy cluster has all operators `Available=True`, `Progressing=False`,
+`Degraded=False`.
+
+---
+
+### 2.8 Access the Cluster
 
 ```bash
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
-oc get nodes
-oc get co   # cluster operators
+
+oc get nodes          # all 5 nodes, Ready
+oc get co             # all operators available
+
+# kubeadmin password
+cat /opt/ocp/cluster/auth/kubeadmin-password
 ```
 
 Web console: `https://console-openshift-console.apps.ocp.lab.local`
+
+Add to your workstation's `/etc/hosts` if accessing from outside the KVM host:
+```
+192.168.200.10  api.ocp.lab.local api-int.ocp.lab.local
+192.168.200.11  console-openshift-console.apps.ocp.lab.local oauth-openshift.apps.ocp.lab.local
+```
 
 ---
 
@@ -217,43 +692,65 @@ All tunable values live in [group_vars/all.yml](group_vars/all.yml):
 |---|---|---|
 | `cluster_name` | `ocp` | OCP cluster name |
 | `base_domain` | `lab.local` | Base DNS domain |
-| `ocp_version` | `4.18` | Used for client downloads |
+| `ocp_version` | `4.18` | Used for client binary downloads |
 | `api_vip` | `192.168.200.10` | API load-balancer VIP |
 | `ingress_vip` | `192.168.200.11` | Ingress/router VIP |
 | `ocp_network_cidr` | `192.168.200.0/24` | Machine network |
+| `ocp_network_gateway` | `192.168.200.1` | Bridge IP, DHCP server, BIND9 address |
 | `control_vm_vcpus` | `4` | vCPUs per control node |
-| `control_vm_ram_mb` | `16384` | RAM per control node (MB) |
-| `control_vm_disk_gb` | `120` | Disk per control node (GB) |
+| `control_vm_ram_mb` | `16384` | RAM per control node (MB) — OCP minimum is 16384 |
+| `control_vm_disk_gb` | `120` | Disk per control node |
 | `worker_vm_vcpus` | `4` | vCPUs per worker |
 | `worker_vm_ram_mb` | `8192` | RAM per worker (MB) |
-| `worker_vm_disk_gb` | `120` | Disk per worker (GB) |
+| `worker_vm_disk_gb` | `120` | Disk per worker |
 | `libvirt_storage_pool_path` | `/opt/images` | Where qcow2 images are stored |
-| `ocp_install_dir` | `/opt/ocp/cluster` | openshift-install working dir |
+| `ocp_install_dir` | `/opt/ocp/cluster` | openshift-install working directory |
 
 ---
 
-## Key Design Notes
+## Project Structure
 
-**Fedora 42 modular libvirt daemons** — Fedora 38+ replaced the monolithic
-`libvirtd` with split socket-activated daemons (`virtqemud`, `virtnetworkd`,
-`virtstoraged`, etc.). The `libvirt_setup` role enables the correct sockets.
-
-**UEFI / q35 VMs** — All VMs use the `q35` machine type with UEFI firmware
-(`--nvram` must be passed to `virsh undefine` to clean up NVRAM state, which
-the cleanup role does).
-
-**Agent-based install** — A single `agent.x86_64.iso` is attached to all
-nodes as a CD-ROM (boot order 1). The first node to boot becomes the
-rendezvous host. After install completes the nodes reboot from their vda disk
-(boot order 2).
-
-**Static IPs via DHCP reservation** — Each VM is assigned a deterministic
-MAC address. The libvirt network's dnsmasq binds that MAC to a fixed IP, so
-the NMState config in `agent-config.yaml` and the DHCP lease always agree.
-
-**No extra Ansible collections required** — Only `ansible.builtin.*` modules
-are used. `community.general` and `ansible.posix` are not installed on this
-host and are avoided.
+```
+kvm-host-setup/
+├── ansible.cfg                          # Inventory path, become, callbacks
+├── inventory/hosts.yml                  # kvm_host → localhost
+├── group_vars/all.yml                   # All variables — edit this file
+│
+├── roles/
+│   ├── cleanup/tasks/main.yml           # Destroy VMs, networks, pools; wipe dirs
+│   ├── packages/tasks/main.yml          # dnf + openshift-install + oc downloads
+│   ├── swap/tasks/main.yml              # 32G swapfile on /opt, fstab entry
+│   ├── libvirt_setup/tasks/main.yml     # Modular daemons, qemu.conf
+│   ├── networks/tasks/main.yml          # labnet: NAT bridge, DNS off, DHCP
+│   ├── dns/
+│   │   ├── tasks/main.yml               # BIND9 deploy + named systemd override
+│   │   ├── templates/named.conf.j2      # BIND options + zone declaration
+│   │   └── templates/ocp.lab.local.zone.j2  # Zone file: VIPs, nodes, wildcard
+│   ├── nm_dns/
+│   │   ├── tasks/main.yml               # NM dnsmasq forwarding config
+│   │   └── templates/ocp.conf.j2        # server=/ocp.lab.local/127.0.0.1#5353
+│   ├── vip/
+│   │   ├── tasks/main.yml               # Deploy libvirt hook, bind VIPs now
+│   │   └── templates/network.hook.j2    # Hook: bind/unbind VIPs + restart named
+│   ├── haproxy/
+│   │   ├── tasks/main.yml               # HAProxy systemd override + config
+│   │   └── templates/haproxy.cfg.j2     # VIP-bound frontends for API + ingress
+│   ├── storage_pool/tasks/main.yml      # /opt/images pool in libvirt
+│   └── vms/
+│       ├── tasks/main.yml               # Disk images + VM XML + start
+│       └── templates/
+│           ├── vm.xml.j2                # VM definition (q35, UEFI, cache=unsafe)
+│           └── eject-monitor.sh.j2      # ISO eject monitor script
+│
+├── ocp-config/
+│   ├── install-config.yaml.j2           # Cluster config (network, replicas)
+│   └── agent-config.yaml.j2             # Per-node NMState static IP + DNS
+│
+├── site.yml                             # Full host setup
+├── cleanup.yml                          # Wipe-only playbook
+├── generate-ocp-config.yml             # Render configs + run openshift-install
+└── eject-iso.yml                        # Monitor image-write + eject + bootstrap-complete
+```
 
 ---
 
@@ -261,94 +758,50 @@ host and are avoided.
 
 ### [T1] `Invalid callback for stdout specified: yaml`
 
-**Symptom** — First `ansible-playbook` run fails immediately:
+**Symptom:**
 ```
 ERROR! Invalid callback for stdout specified: yaml
 ```
 
-**Cause** — `ansible-core` on Fedora 42 does not ship the `yaml` stdout
-callback plugin. Only `ansible.builtin.*` callbacks are available without
-extra collections.
+**Cause:** `ansible-core` on Fedora 42 does not ship the `yaml` stdout
+callback. Only `ansible.builtin.*` callbacks are available without extra
+collections.
 
-**Fix** — Use the built-in `default` callback and the FQCN for
-`profile_tasks` in `ansible.cfg`:
-
+**Fix:** Use the built-in `default` callback in `ansible.cfg`:
 ```ini
 [defaults]
 stdout_callback   = ansible.builtin.default
 callbacks_enabled = ansible.posix.profile_tasks
 ```
 
-To check which callbacks are available on your system:
-```bash
-ansible-doc -t callback -l
-```
-
 ---
 
-### [T2] `sudo: a password is required` — fact gathering fails
+### [T2] `sudo: a password is required` during fact gathering
 
-**Symptom** — Playbook fails at `Gathering Facts`:
+**Symptom:**
 ```
-fatal: [kvm_host]: FAILED! => {
-  "msg": "MODULE FAILURE ... sudo: a password is required"
-}
+fatal: [kvm_host]: FAILED! => {"msg": "MODULE FAILURE ... sudo: a password is required"}
 ```
 
-**Cause** — `become = True` is set globally in `ansible.cfg` so Ansible
-tries to run even fact gathering as root, but no sudo password was supplied.
-
-**Fix** — Add `become_ask_pass = True` to `ansible.cfg` so Ansible prompts
-for the sudo password at the start of each run:
-
-```ini
-[privilege_escalation]
-become          = True
-become_method   = sudo
-become_ask_pass = True
-```
-
-Alternatively, pass `-K` on the command line:
+**Fix:** Add `become_ask_pass = True` to `ansible.cfg` or pass `-K`:
 ```bash
 ansible-playbook site.yml -K
 ```
 
 ---
 
-### [T3] DNS resolution broken — `Could not resolve host`
+### [T3] DNS resolution broken after cleanup — `Could not resolve host`
 
-**Symptom** — `packages` role fails when DNF tries to download metadata:
-```
-fatal: [kvm_host]: FAILED! => {
-  "msg": "Failed to download metadata ... Cannot prepare internal mirrorlist:
-          Curl error (6): Could not resolve hostname for
-          https://mirrors.fedoraproject.org ..."
-}
-```
+**Symptom:** DNF fails with `Could not resolve hostname mirrors.fedoraproject.org`.
 
-**Cause** — Two stale configurations from a previous OCP lab deployment were
-poisoning the host DNS:
+**Cause:** Stale configurations from a previous lab deployment:
+1. `/etc/systemd/resolved.conf` hardcoded to a dead DNS server
+2. A NetworkManager connection profile for a decommissioned bridge had a
+   stale `ipv4.dns` pointing to a non-existent gateway
 
-1. **`/etc/systemd/resolved.conf`** was hardcoded to `DNS=127.0.0.1` — a
-   dnsmasq instance that no longer exists after cleanup — and
-   `DNSStubListener=no`, disabling the 127.0.0.53 stub resolver.
-
-2. **NetworkManager `virbr1` connection profile** had `ipv4.dns=192.168.10.2`
-   (the old provisioning network gateway) which NM pushes to systemd-resolved
-   as a global DNS server even when the interface is down.
-
-Together these routed all DNS queries to dead servers. Diagnosing:
+**Fix:**
 ```bash
-resolvectl status          # shows Global DNS, Domains, resolv.conf mode
-nmcli connection show virbr1 | grep dns
-cat /etc/systemd/resolved.conf
-```
-
-**Fix** — Reset systemd-resolved to use public DNS, re-enable the stub
-listener, and delete the dead virbr1 NM connection profile:
-
-```bash
-# 1. Fix systemd-resolved
+# Reset systemd-resolved
 sudo tee /etc/systemd/resolved.conf <<'EOF'
 [Resolve]
 DNS=8.8.8.8 1.1.1.1
@@ -356,452 +809,210 @@ FallbackDNS=8.8.4.4 9.9.9.9
 DNSStubListener=yes
 EOF
 
-# 2. Delete the stale virbr1 NM connection (provisioning net is gone)
-sudo nmcli connection delete virbr1
+# Remove stale NM connection profiles
+sudo nmcli connection show   # look for dead virbr/provisioning connections
+sudo nmcli connection delete <stale-connection>
 
-# 3. Restart both services
 sudo systemctl restart systemd-resolved NetworkManager
-
-# 4. Verify resolution is working
-dig mirrors.fedoraproject.org +short | head -3
 ```
-
-**Root cause note** — The `cleanup` role destroys libvirt networks but does
-not remove the corresponding NetworkManager connection profiles or
-`/etc/systemd/resolved.conf`. If DNS breaks again after a cleanup run, repeat
-the steps above.
 
 ---
 
 ### [T4] `dnsmasq: failed to create listening socket — Address already in use`
 
-**Symptom** — `networks` role fails when starting `labnet`:
-```
-error: Failed to start network labnet
-dnsmasq: failed to create listening socket for 192.168.200.1: Address already in use
-```
+**Symptom:** `networks` role fails starting `labnet` with address conflict on `192.168.200.1:53`.
 
-**Cause** — Stale dnsmasq processes are still running from networks that were
-created by the old monolithic `libvirtd`. After switching to modular libvirt
-daemons (`virtnetworkd`), those networks are invisible to `virsh net-list` so
-the cleanup role's `virsh net-destroy` skips them — but their dnsmasq
-processes and PID files remain in `/var/run/libvirt/network/`.
-
-Diagnose:
+**Cause 1 — Stale dnsmasq from old monolithic libvirtd:**
 ```bash
-ls /var/run/libvirt/network/      # stale *.pid files are the giveaway
-ls /var/lib/libvirt/dnsmasq/     # virbr*.status files also indicate stale state
+ls /var/run/libvirt/network/   # stale *.pid files
+```
+Fix:
+```bash
+sudo kill $(cat /var/run/libvirt/network/*.pid 2>/dev/null) 2>/dev/null
+sudo rm -rf /var/run/libvirt/network/* /var/lib/libvirt/dnsmasq/virbr*.status
 ```
 
-**Fix** — Kill the orphaned processes and clear the stale runtime state, then
-retry:
-
+**Cause 2 — BIND9 running and grabbing all ports:**
 ```bash
-# Kill dnsmasq processes still referenced by stale PID files
-sudo kill $(cat /var/run/libvirt/network/br_labnet.pid) 2>/dev/null
-sudo kill $(cat /var/run/libvirt/network/provisioning.pid) 2>/dev/null
-
-# Remove all stale runtime state
-sudo rm -rf /var/run/libvirt/network/* \
-            /var/lib/libvirt/dnsmasq/virbr*.status
-
-# Retry
-ansible-playbook site.yml --tags networks
+sudo ss -tulnp | grep ':53'   # named listening on 192.168.200.1:53
 ```
-
-**If the error persists after clearing PID files** — the libvirt `default`
-network may still be active and its dnsmasq may be binding to a wildcard
-address. The root cause is that `virsh net-list` without root returns an
-empty list (connects to the user session socket, not the system socket), so
-the cleanup role was silently skipping the `default` network.
-
-Verify with sudo:
+Fix: BIND9 should only bind after virbr4 exists (the network hook restarts it).
+If named started before virbr4, it grabbed `0.0.0.0:53`. Stop and restart:
 ```bash
-sudo virsh -c qemu:///system net-list --all
-```
-
-Destroy the default network, then retry:
-```bash
-sudo virsh -c qemu:///system net-destroy default
-sudo virsh -c qemu:///system net-undefine default
-ansible-playbook site.yml --tags networks
-```
-
-All `virsh` calls in the playbooks now use `-c qemu:///system` explicitly so
-they always connect to the system socket regardless of the user running them.
-The cleanup role no longer skips the `default` network.
-
-The `libvirt_setup` role also writes an NM config to leave `virbr*`/`vnet*`
-interfaces unmanaged, preventing NM from racing for port 53:
-
-```bash
-sudo tee /etc/NetworkManager/conf.d/99-libvirt.conf <<'EOF'
-[keyfile]
-unmanaged-devices=interface-name:virbr*;interface-name:vnet*
-EOF
-sudo nmcli general reload conf
-```
-
----
-
-### [T5] `named` (BIND9) grabs port 53 on the bridge IP
-
-**Symptom** — Same `Address already in use` error on `192.168.200.1:53`.
-All previous fixes applied but the problem persists. Diagnostic:
-
-```bash
-sudo ss -tulnp | grep ':53'
-# shows: named pid=XXXXX listening on 127.0.0.1:53 and all interface IPs
-```
-
-**Cause** — BIND9 (`named`) was previously installed and is running as a
-system service. BIND listens on **all interfaces** by default, including
-new ones that appear dynamically. When libvirt creates `virbr4` with
-`192.168.200.1`, `named` immediately binds `192.168.200.1:53`, so libvirt's
-dnsmasq cannot bind to the same address moments later.
-
-**Fix** — Stop and disable `named`. For this KVM lab, libvirt's built-in
-dnsmasq provides DNS for the OCP network; BIND9 is not needed.
-
-```bash
-sudo systemctl stop named
-sudo systemctl disable named
-
-# Redefine the network and retry
-sudo virsh -c qemu:///system net-undefine labnet
-ansible-playbook site.yml --tags networks
-```
-
-The `libvirt_setup` role now automatically stops and disables `named` if it
-is found running, so this will not recur on future runs.
-
-**Note** — If you need `named` for other purposes, configure it to listen
-only on loopback instead:
-
-```bash
-# Add to /etc/named.conf options block:
-#   listen-on { 127.0.0.1; };
-#   listen-on-v6 { ::1; };
 sudo systemctl restart named
 ```
 
 ---
 
-### [T6] `exec: "nmstatectl": executable file not found in $PATH`
+### [T5] `exec: "nmstatectl": executable file not found`
 
-**Symptom** — `generate-ocp-config.yml` fails at the "Generate agent ISO" task:
-
+**Symptom:** `generate-ocp-config.yml` fails at ISO generation:
 ```
-level=fatal msg=failed to generate asset "NMState Config": staticNetwork
-  configuration is not valid: 5 errors occurred:
-level=fatal msg=  * failed to validate network yaml for host 0, install
-  nmstate package, exec: "nmstatectl": executable file not found in $PATH
-...
+failed to validate network yaml ... exec: "nmstatectl": executable file not found
 ```
 
-**Cause** — `openshift-install agent create image` shells out to `nmstatectl`
-to validate every host's static network YAML before writing the ISO. The
-`nmstate` package (which provides `nmstatectl`) is a runtime dependency of the
-agent-based installer but was not in the KVM host package list.
-
-**Fix** — Install `nmstate` on the machine running `openshift-install`:
-
+**Fix:** Install the `nmstate` package:
 ```bash
 sudo dnf install -y nmstate
-```
-
-Verify:
-```bash
-nmstatectl version
-```
-
-Then re-run the playbook:
-```bash
 ansible-playbook generate-ocp-config.yml
 ```
 
-The `packages` role now includes `nmstate` so it will be installed
-automatically on future `ansible-playbook site.yml` runs.
+The `packages` role includes `nmstate` so a full `site.yml` run installs it.
 
 ---
 
-### [T7] `interfaces: unknown field 'macAddress' at line 6 column 1`
+### [T6] `unknown field 'macAddress'` in NMState validation
 
-**Symptom** — After installing `nmstate`, the ISO generation still fails:
-
+**Symptom:**
 ```
-level=error msg=Provide file is not valid NetworkState or NetworkPolicy:
-  interfaces: unknown field `macAddress` at line 6 column 1
-level=fatal msg=  * failed to validate network yaml for host 0, failed to
-  execute 'nmstatectl gc', error: Nmstate version: 2.2.57
+interfaces: unknown field `macAddress` at line 6 column 1
 ```
 
-**Cause** — `agent-config.yaml` uses `macAddress` (camelCase) inside the
-`networkConfig.interfaces` block. That block is NMState YAML. NMState 2.x
-requires the hyphenated form `mac-address`; camelCase was only accepted by
-older nmstate 1.x.
+**Cause:** NMState 2.x requires `mac-address` (hyphenated) inside
+`networkConfig.interfaces`. The camelCase `macAddress` was only accepted by
+nmstate 1.x.
 
-Note the two different contexts in `agent-config.yaml`:
+Note the distinction in `agent-config.yaml`:
+- `hosts[].interfaces[].macAddress` — OCP AgentConfig API field, stays camelCase
+- `hosts[].networkConfig.interfaces[].mac-address` — NMState 2.x field, use hyphen
 
-| Location | Field name | Why |
-|---|---|---|
-| `hosts[].interfaces[].macAddress` | `macAddress` | OCP `AgentConfig` API — matches the physical NIC to configure |
-| `hosts[].networkConfig.interfaces[].mac-address` | `mac-address` | NMState 2.x format — sets the MAC in the network state |
+The template `ocp-config/agent-config.yaml.j2` uses the correct form.
 
-**Fix** — In `ocp-config/agent-config.yaml.j2`, change `macAddress` to
-`mac-address` inside every `networkConfig.interfaces` block only:
+---
 
-```yaml
-# WRONG (nmstate 1.x / camelCase)
-networkConfig:
-  interfaces:
-    - name: enp1s0
-      macAddress: 52:54:00:c0:01:01   # ← fails with nmstate 2.x
+### [T7] `installation-disk-speed-check` timeout (exit code 124)
 
-# CORRECT (nmstate 2.x / hyphenated)
-networkConfig:
-  interfaces:
-    - name: enp1s0
-      mac-address: 52:54:00:c0:01:01  # ← accepted
+**Symptom:** All nodes stuck at `preparing-for-installation` with:
+```
+exit-code <124>   # timeout
 ```
 
-The top-level `interfaces[].macAddress` entries (the OCP host-interface
-matcher) keep the camelCase form — that is part of the OCP API, not NMState.
+**Cause:** OCP runs `fio --rw=write --ioengine=sync --fdatasync=1` to verify
+disk speed. With `cache='none'` (QEMU default), every guest `fdatasync` flushes
+to the physical disk. On a new qcow2, each write also triggers cluster
+allocation flushes. The combined overhead causes every fdatasync to take
+100–200ms, giving <10 IOPS — far below OCP's 10 MB/s minimum.
 
-The template has been updated; re-run:
+**Fix:** The VM XML template uses `cache='unsafe' io='threads'`:
+- Guest `fdatasync` becomes a no-op on the host
+- fio completes in seconds into the host page cache
+- Acceptable for a lab; do not use in production
+
+---
+
+### [T8] DNS validation warning: `Error while evaluating DNS resolution on this host`
+
+**Symptom:** Nodes stuck at agent validation with persistent DNS warnings.
+
+**What to check first:**
 ```bash
-ansible-playbook generate-ocp-config.yml
+# From the host, verify api-int resolves
+dig api-int.ocp.lab.local @192.168.200.1 +short   # must return 192.168.200.10
+
+# Verify AAAA queries return immediately (no timeout)
+timeout 2 dig api.ocp.lab.local AAAA @192.168.200.1 | grep status
+```
+
+**Cause:** Either `api-int.ocp.lab.local` is missing from BIND, or the AAAA
+query is timing out (loop). In the current setup with BIND9, AAAA queries
+return `NOERROR` (empty) or `NXDOMAIN` immediately — no timeout.
+
+If `api-int` is missing, re-run the dns role:
+```bash
+ansible-playbook site.yml --tags dns
 ```
 
 ---
 
-### [T8] `installation-disk-speed-check` times out (exit code 124) on all hosts
+### [T9] Node booted back into installer after image write
 
-**Symptom** — After nodes boot and reach `preparing-for-installation`, the
-assisted-service repeatedly submits a disk speed check that times out after
-480 seconds on every node. The service log shows:
-
+**Symptom:**
 ```
-exit-code <124> stderr <kill container: No such process ...>
-error="unexpected end of JSON input"
+Expected the host to boot from disk, but it booted the installation image
 ```
 
-The check runs:
-```
-fio --rw=write --ioengine=sync --size=22m --bs=2300 --fdatasync=1
-```
-This performs ~10,000 sequential writes each followed by an `fdatasync`. With
-`cache='none'` (the VM default), every guest `fdatasync` flushes straight
-through to the physical disk — and on a new qcow2 image, each write also
-triggers a cluster allocation + L2 table update flush. The combined overhead
-makes even a fast SSD appear to do <20 IOPS, far below OCP's 10 MB/s threshold.
-
-`virsh update-device --live` cannot change cache mode on a running disk:
-```
-error: Operation not supported: cannot modify field 'cache' of the disk
-```
-
-**Why `writeback` is not enough** — `cache=writeback` was tried first but
-also fails on a spinning HDD. With `writeback`, QEMU still calls the host
-`fsync()` for every guest `fdatasync`, so the 480-second timeout is hit on
-the second and subsequent test rounds (the first round passes because the
-page cache is cold and fsyncs return quickly; by round 2, the HDD is busy
-flushing dirty pages from round 1 and both rounds compete for the same disk).
-
-**Fix** — Use `cache=unsafe`, which makes guest `fdatasync` a complete no-op
-on the host. fio completes in seconds writing into the host page cache.
-
+**Fix:** Eject the ISO and reboot the specific node:
 ```bash
-# 1. Destroy and undefine all VMs (qcow2 files are preserved)
-for vm in ocp-control-1 ocp-control-2 ocp-control-3 ocp-worker-1 ocp-worker-2; do
-  sudo virsh -c qemu:///system destroy $vm 2>/dev/null
-  sudo virsh -c qemu:///system undefine $vm --nvram
-done
-
-# 2. Redefine with cache='unsafe' io='threads' and start
-ansible-playbook site.yml --tags vms
+sudo virsh -c qemu:///system change-media ocp-control-1 sda --eject --live --config
+sudo virsh -c qemu:///system reboot ocp-control-1
 ```
 
-The `vm.xml.j2` template now uses `cache='unsafe' io='threads'`.
-
-**Trade-off** — Guest fsyncs are never flushed to the physical disk; a KVM
-host crash during install could corrupt the qcow2 image. Acceptable for a
-lab. Do NOT use for production VMs or any data you cannot afford to lose.
+To prevent this, always run `eject-iso.yml` in parallel with the install.
 
 ---
 
-### [T9] `Error while evaluating DNS resolution on this host` during bootstrap
+### [T10] Bootstrap-complete timeout — nodes never joined cluster
 
-**Symptom** — After VMs boot and agents connect, DNS validation warnings appear
-for all hosts and never clear:
+**Symptom:** `wait-for bootstrap-complete` times out. `oc get nodes` shows
+only 1 node. Nodes 2–5 have no SSH access (Permission denied).
 
-```
-WARNING Host ocp-control-1.ocp.lab.local validation: Error while evaluating DNS resolution on this host
-```
+**Root cause:** If `api-int.ocp.lab.local` did not resolve at the moment
+a node's RHCOS first-boot ran ignition, that node never fetched its ignition
+config and booted without SSH keys, kubelet, or cluster membership. Fixing
+DNS on a live cluster does not recover these nodes — ignition runs once, in
+the initramfs, and does not retry.
 
-NTP and majority-connectivity warnings that appear alongside this are **transient** —
-they self-resolve within a few minutes as all nodes finish booting. The DNS
-error is the real issue.
-
-**Cause** — The libvirt dnsmasq DNS config was missing `api-int.ocp.lab.local`.
-OCP nodes use `api-int` (the internal API endpoint) for intra-cluster
-communication during installation. It must resolve to `api_vip`
-(`192.168.200.10`) from within every node. Without it, the kubelet and cluster
-operators cannot reach the API server and the install eventually stalls.
-
-The `labnet.xml.j2` template had `api.ocp.lab.local` → 192.168.200.10 but
-was missing the `api-int` alias on the same IP.
-
-**Fix — inject into the live running network** (no VM or network restart needed):
-
-```bash
-sudo virsh -c qemu:///system net-update labnet add dns-host \
-  '<host ip="192.168.200.10"><hostname>api-int.ocp.lab.local</hostname></host>' \
-  --live --config
-```
-
-Verify:
-```bash
-dig api-int.ocp.lab.local @192.168.200.1 +short
-# expected: 192.168.200.10
-```
-
-The `labnet.xml.j2` template now includes `api-int` so future runs do not
-require this manual step.
-
----
-
-### [T10] HAProxy pointing to wrong backend IPs; API/Ingress VIPs unreachable
-
-**Symptom** — After bootstrap starts, `openshift-install agent wait-for
-bootstrap-complete` cannot connect. The API and Ingress VIPs don't respond:
-
-```bash
-ping 192.168.200.10   # 100% packet loss
-curl -k https://api.ocp.lab.local:6443   # connection refused / timeout
-```
-
-Inspecting `/etc/haproxy/haproxy.cfg` shows backends pointing to
-`192.168.200.210–213` and `226–227` instead of the actual node IPs, and
-the VIPs are not assigned to `virbr4`.
-
-**Cause** — HAProxy was not managed by the Ansible project. A stale config
-from a previous install used a different IP scheme. Additionally, the VIPs
-(`192.168.200.10` and `192.168.200.11`) must be explicitly assigned to
-`virbr4` on the KVM host so the host can respond to ARP for those addresses
-and HAProxy can accept connections on them.
-
-**Immediate fix** — Correct the backends and assign the VIPs:
-
-```bash
-# 1. Write correct HAProxy config
-ansible-playbook site.yml --tags haproxy
-
-# OR manually:
-sudo systemctl restart haproxy
-
-# 2. Assign VIPs to the bridge (if not yet present)
-sudo ip addr add 192.168.200.10/32 dev virbr4
-sudo ip addr add 192.168.200.11/32 dev virbr4
-
-# 3. Verify
-curl -k --connect-timeout 5 https://api.ocp.lab.local:6443/readyz
-```
-
-**Permanent fix** — The `haproxy` role now generates `/etc/haproxy/haproxy.cfg`
-from a Jinja2 template using `control_nodes` and `worker_nodes` variables, and
-assigns the VIPs to `virbr4` via `ip addr`. A NetworkManager dispatcher script
-at `/etc/NetworkManager/dispatcher.d/99-ocp-vips` re-assigns the VIPs after
-each reboot.
-
----
-
-### Check VM console
-
-```bash
-virsh console ocp-control-1
-# or
-virt-viewer ocp-control-1
-```
-
-### Check agent bootstrap logs (from any control node)
-
-```bash
-ssh core@192.168.200.21
-journalctl -u agent.service -f
-```
-
-### Root filesystem full
-
-The root NVMe (`/dev/nvme0n1p6`, 29 GB btrfs) was at 95% before cleanup.
-The `cleanup` role runs `dnf clean all`, `journalctl --vacuum-size=200M`, and
-`docker system prune -af --volumes` to reclaim space.
-
-If it fills again, check:
-
-```bash
-du -sh /var/lib/docker /var/lib/libvirt /var/log
-sudo btrfs filesystem usage /
-```
-
-Consider moving Docker's data root to `/opt`:
-
-```bash
-# /etc/docker/daemon.json
-{ "data-root": "/opt/docker" }
-```
-
-### [T11] Bootstrap-complete timeout — only one node joined, kube-apiserver never deployed
-
-**Symptom** — `openshift-install agent wait-for bootstrap-complete` times out
-with `context deadline exceeded`. Only one control node appears in
-`oc get nodes`. The `kube-apiserver` and `kube-controller-manager` cluster
-operators show `StaticPodsAvailable: 0 nodes are active`, and the second and
-third control nodes cannot be reached via SSH (Permission denied —
-`authorized_keys` was never written).
-
-**Root cause (cascade)** — `api-int.ocp.lab.local` was missing from the live
-libvirt DNS at the moment nodes first booted. RHCOS first-boot ignition reads
-`/dev/sda3/ignition/config.ign`, which contains the MCS URL
-`https://api-int.ocp.lab.local:22623/config/master`. Without DNS, the ignition
-fetch fails silently and RHCOS boots with no SSH keys, no kubelet, and no
-cluster membership. This leaves the cluster with a single node, which triggers
-an MCO scheduling deadlock (the only node gets cordoned for config application,
-blocking the MCO controller from scheduling its own pods), which prevents
-`kube-apiserver` static pods from being deployed, which prevents
-bootstrap-complete.
-
-**Critical caveat** — Fixing the DNS on the live network *after* the nodes have
-already booted does **not** recover them. Ignition runs once, in the initramfs,
-on first boot. There is no automatic retry once the system is up. The only
-recovery is to reinstall the affected nodes (or start from scratch).
-
-**Prevention** — The `labnet.xml.j2` template includes both
-`api.ocp.lab.local` and `api-int.ocp.lab.local` on `api_vip` so a fresh
-`site.yml` run sets it correctly before any VM boots. Never start VMs before
-verifying:
-
-```bash
-dig api-int.ocp.lab.local @192.168.200.1 +short   # must return api_vip
-```
-
-**Recovery when DNS was wrong for a live install** — Wipe and reinstall:
-
+**Recovery:** Full reinstall.
 ```bash
 ansible-playbook cleanup.yml
 ansible-playbook site.yml
-cp ~/pull-secret.json /opt/ocp/pull-secret.json && chmod 600 /opt/ocp/pull-secret.json
 ansible-playbook generate-ocp-config.yml
 ansible-playbook site.yml --tags vms
-ansible-playbook eject-iso.yml    # monitors + ejects + waits for bootstrap-complete
+ansible-playbook eject-iso.yml
+```
+
+**Prevention:** Always verify before starting VMs:
+```bash
+dig api-int.ocp.lab.local @192.168.200.1 +short   # MUST return 192.168.200.10
 ```
 
 ---
 
-### libvirt network not starting
+### [T11] `openshift-apiserver` pod SIGSEGV (exit code 139) on a control node
+
+**Symptom:**
+```
+apiserver crashlooping container ... exit 139 (SIGSEGV)
+```
+
+**Cause:** Memory overcommit exhausted. The host has 62 GB RAM and 5 VMs
+allocated 64 GB total. When zram swap is full and the 32 GB swapfile on
+`/opt/swapfile` is not active (or not in fstab), the kernel cannot back
+anonymous mmaps. Go runtime mmaps fail, causing SIGSEGV inside any Go binary.
+
+**Fix:**
+```bash
+# Verify swap is active and correct
+swapon --show
+grep swapfile /etc/fstab
+
+# If swapfile is missing from fstab
+echo '/opt/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab
+sudo swapon /opt/swapfile
+```
+
+The `swap` role handles this automatically.
+
+---
+
+### Useful diagnostic commands
 
 ```bash
-systemctl status virtnetworkd.socket
-virsh net-list --all
-virsh net-start labnet
+# VM console (Ctrl+] to exit)
+virsh console ocp-control-1
+
+# SSH into a node (core user, key from ~/.ssh/id_rsa)
+ssh core@192.168.200.21
+
+# Watch agent bootstrap logs on the rendezvous node
+ssh core@192.168.200.21 journalctl -u agent.service -f
+
+# Install log (on the KVM host)
+tail -f /opt/ocp/cluster/.openshift_install.log
+
+# Check all operator status
+export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
+oc get co
+oc get nodes
+oc get pods -A | grep -v Running | grep -v Completed
 ```
