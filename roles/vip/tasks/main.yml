@@ -2,6 +2,14 @@
 # Libvirt network hook: binds API and ingress VIPs to virbr4 when labnet starts
 # and triggers a named restart so BIND can bind to 192.168.200.1:53
 
+# The modular virtnetworkd daemon (virtnetworkd_t) is not allowed by the default
+# SELinux policy to execute virt_hook_t files. This boolean grants that permission.
+- name: Allow virtnetworkd to execute libvirt hook scripts (SELinux)
+  ansible.posix.seboolean:
+    name: virt_hooks_unconfined
+    state: true
+    persistent: true
+
 - name: Ensure libvirt hooks directory exists
   ansible.builtin.file:
     path: /etc/libvirt/hooks
