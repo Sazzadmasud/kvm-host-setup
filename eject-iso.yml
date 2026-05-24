@@ -14,8 +14,8 @@
   gather_facts: true
 
   vars:
-    bootstrap_timeout_minutes: 90  # max wait for bootstrap-complete
-    install_timeout_minutes: 60    # max wait for install-complete (cluster operators)
+    bootstrap_timeout_minutes: 90   # max wait for bootstrap-complete
+    install_timeout_minutes: 120    # max wait for install-complete (cluster operators need ~90m)
 
   tasks:
     - name: Start openshift-install agent wait-for bootstrap-complete (background)
