@@ -1,10 +1,10 @@
 ---
 # Monitors RHCOS image-write progress, ejects the agent ISO from each VM as
-# soon as its disk write completes, then waits for bootstrap-complete.
+# soon as its disk write completes, waits for bootstrap-complete, then waits
+# for install-complete. Fixes ownership and configures KUBECONFIG on finish.
 #
 # Run this after: ansible-playbook site.yml --tags vms
-# Then run:       openshift-install agent wait-for install-complete \
-#                   --dir /opt/ocp/cluster --log-level=info
+#   (or use deploy.yml which chains all steps automatically)
 #
 # Why eject early?
 #   UEFI NVRAM on KVM does not reliably honour the XML boot-order override;
@@ -18,13 +18,14 @@
 # Usage:
 #   ansible-playbook eject-iso.yml
 
-- name: Eject agent ISO after RHCOS image write, then reach bootstrap-complete
+- name: Eject agent ISO after RHCOS image write, then reach install-complete
   hosts: kvm_hosts
-  gather_facts: false
+  gather_facts: true
 
   vars:
-    eject_timeout_minutes: 45     # max wait for image writes across all nodes
-    bootstrap_timeout_minutes: 90 # max wait for bootstrap-complete
+    eject_timeout_minutes: 45      # max wait for image writes across all nodes
+    bootstrap_timeout_minutes: 90  # max wait for bootstrap-complete
+    install_timeout_minutes: 60    # max wait for install-complete (cluster operators)
 
   tasks:
     - name: Build full VM list
@@ -79,3 +80,61 @@
       ansible.builtin.fail:
         msg: "Bootstrap-complete returned rc={{ bs_result.rc }}"
       when: (bs_result.rc | default(1)) != 0
+
+    # ──────────────────────────────────────────────
+    #  Phase 2 — wait for install-complete
+    # ──────────────────────────────────────────────
+    - name: Start wait-for install-complete (background)
+      ansible.builtin.command: >
+        /usr/local/bin/openshift-install agent wait-for install-complete
+        --dir {{ ocp_install_dir }} --log-level=info
+      async: "{{ install_timeout_minutes * 60 }}"
+      poll: 0
+      register: install_job
+
+    - name: Wait for install-complete
+      ansible.builtin.async_status:
+        jid: "{{ install_job.ansible_job_id }}"
+      register: ic_result
+      until: ic_result.finished
+      retries: "{{ install_timeout_minutes * 2 }}"
+      delay: 30
+
+    - name: Install-complete outcome
+      ansible.builtin.debug:
+        msg: >-
+          Install {{ 'completed successfully' if (ic_result.rc | default(1)) == 0
+                     else 'FAILED (rc=' + ((ic_result.rc | default('?')) | string) + ')' }}
+
+    - name: Fail play if install did not complete
+      ansible.builtin.fail:
+        msg: "Install-complete returned rc={{ ic_result.rc }}"
+      when: (ic_result.rc | default(1)) != 0
+
+    # ──────────────────────────────────────────────
+    #  Post-install fixups
+    # ──────────────────────────────────────────────
+    - name: Fix ownership of OCP install directory
+      ansible.builtin.file:
+        path: "{{ ocp_base_dir }}"
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_id }}"
+        recurse: true
+      become: true
+
+    - name: Export KUBECONFIG in ~/.bashrc
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        regexp: '^export KUBECONFIG='
+        line: "export KUBECONFIG={{ ocp_install_dir }}/auth/kubeconfig"
+        state: present
+      become: false
+
+    - name: Installation complete
+      ansible.builtin.debug:
+        msg:
+          - "OCP {{ ocp_version }} install complete."
+          - "API:     https://api.{{ cluster_name }}.{{ base_domain }}:6443"
+          - "Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ base_domain }}"
+          - "kubeadmin password: cat {{ ocp_install_dir }}/auth/kubeadmin-password"
+          - "KUBECONFIG added to ~/.bashrc — run: source ~/.bashrc"

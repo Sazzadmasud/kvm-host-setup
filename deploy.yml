@@ -1,0 +1,70 @@
+---
+# Single-command unattended OCP agent-based install.
+# Chains: host setup → ISO generation → VM boot → bootstrap-complete → install-complete.
+#
+# Prerequisites (one-time setup):
+#   1. Pull secret at {{ ocp_base_dir }}/pull-secret.json
+#      Download from: https://console.redhat.com/openshift/install/pull-secret
+#   2. Passwordless sudo for the Ansible user:
+#      echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$USER-nopasswd
+#
+# Usage:
+#   ansible-playbook deploy.yml
+#
+# To re-run from a clean slate:
+#   ansible-playbook cleanup.yml -e "unattended=true"
+#   ansible-playbook deploy.yml
+
+- name: Verify unattended prerequisites
+  hosts: kvm_hosts
+  gather_facts: true
+
+  tasks:
+    - name: Verify passwordless sudo is configured
+      ansible.builtin.command: sudo -n true
+      become: false
+      changed_when: false
+      register: sudo_check
+      failed_when: false
+
+    - name: Abort if sudo requires a password
+      ansible.builtin.fail:
+        msg: >-
+          Passwordless sudo is required for unattended install.
+          Run: echo '{{ ansible_user_id }} ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/{{ ansible_user_id }}-nopasswd
+      when: sudo_check.rc != 0
+
+    - name: Verify pull secret exists
+      ansible.builtin.stat:
+        path: "{{ ocp_base_dir }}/pull-secret.json"
+      register: ps_check
+
+    - name: Abort if pull secret is missing
+      ansible.builtin.fail:
+        msg: >-
+          Pull secret not found at {{ ocp_base_dir }}/pull-secret.json.
+          Download it from: https://console.redhat.com/openshift/install/pull-secret
+      when: not ps_check.stat.exists
+
+# Phase 1 — KVM host setup + define VMs (VMs won't start yet — no ISO)
+- import_playbook: site.yml
+
+# Phase 2 — Render OCP config and generate agent ISO
+- import_playbook: generate-ocp-config.yml
+
+# Phase 3 — Start VMs (ISO now exists)
+- name: Start OCP VMs
+  hosts: kvm_hosts
+  gather_facts: false
+
+  tasks:
+    - name: Start all OCP VMs
+      ansible.builtin.command: "virsh -c qemu:///system start {{ item.name }}"
+      loop: "{{ control_nodes + worker_nodes }}"
+      register: vm_start
+      changed_when: vm_start.rc == 0
+      failed_when: vm_start.rc != 0 and 'already running' not in vm_start.stderr
+      become: true
+
+# Phase 4 — Eject ISO, wait for bootstrap-complete, then install-complete
+- import_playbook: eject-iso.yml

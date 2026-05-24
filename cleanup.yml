@@ -4,7 +4,8 @@
 #
 # Usage:
 #   ansible-playbook cleanup.yml
-#   ansible-playbook cleanup.yml -e "skip_dir_cleanup=true"  # keep /opt dirs
+#   ansible-playbook cleanup.yml -e "skip_dir_cleanup=true"   # keep /opt dirs
+#   ansible-playbook cleanup.yml -e "unattended=true"         # skip confirmation prompt
 
 - name: Full KVM host cleanup
   hosts: kvm_hosts
@@ -12,14 +13,16 @@
 
   vars:
     skip_dir_cleanup: false
+    unattended: false
 
   pre_tasks:
     - name: Warn user
       ansible.builtin.pause:
         prompt: |
-          ⚠️  This will DESTROY all VMs, networks, storage pools,
+          WARNING: This will DESTROY all VMs, networks, storage pools,
           and wipe {{ cleanup_dirs | join(', ') }}.
           Press ENTER to continue or Ctrl-C to abort.
+      when: not (unattended | bool)
 
   roles:
     - role: cleanup

@@ -56,6 +56,10 @@
         url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-{{ ocp_version }}/openshift-install-linux.tar.gz"
         dest: "{{ tmpdir.path }}/openshift-install-linux.tar.gz"
         mode: "0644"
+      register: dl_ocp_install
+      retries: 3
+      delay: 10
+      until: dl_ocp_install is succeeded
 
     - name: Extract openshift-install
       ansible.builtin.unarchive:
@@ -93,6 +97,10 @@
         url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-{{ ocp_version }}/openshift-client-linux.tar.gz"
         dest: "{{ tmpdir_oc.path }}/openshift-client-linux.tar.gz"
         mode: "0644"
+      register: dl_oc
+      retries: 3
+      delay: 10
+      until: dl_oc is succeeded
 
     - name: Extract oc and kubectl
       ansible.builtin.unarchive:

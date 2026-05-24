@@ -89,8 +89,10 @@
         openshift-install agent create image
         --dir {{ ocp_install_dir }}
         --log-level info
+      args:
+        creates: "{{ ocp_install_dir }}/agent.x86_64.iso"
       register: iso_create
-      changed_when: true
+      changed_when: iso_create.rc | default(-1) == 0
 
     - name: Verify ISO was created
       ansible.builtin.stat:
