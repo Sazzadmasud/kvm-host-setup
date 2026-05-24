@@ -84,3 +84,10 @@ cleanup_dirs:
 
 # libvirt user (will be added to libvirt group)
 libvirt_user: "{{ ansible_user_id }}"
+
+# ──────────────────────────────────────────────
+#  Sushy — Redfish emulator for libvirt VMs
+# ──────────────────────────────────────────────
+sushy_port: 8000
+# Accessible from VMs via the bridge gateway
+sushy_host: "{{ ocp_network_gateway }}"

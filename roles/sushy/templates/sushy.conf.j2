@@ -1,0 +1,21 @@
+# sushy-emulator configuration — Redfish API backed by libvirt
+# Managed by Ansible — do not edit by hand
+
+SUSHY_EMULATOR_LISTEN_IP = '0.0.0.0'
+SUSHY_EMULATOR_LISTEN_PORT = {{ sushy_port }}
+
+SUSHY_EMULATOR_SSL_CERT = None
+SUSHY_EMULATOR_SSL_KEY = None
+
+# No auth for lab — all Redfish endpoints are unauthenticated
+SUSHY_EMULATOR_AUTH_FILE = None
+
+# libvirt backend
+SUSHY_EMULATOR_LIBVIRT_URI = 'qemu:///system'
+
+# Let the VM XML control boot order rather than EFI NVRAM manipulation.
+# The CDROM (sda) is already boot order 1 in the domain XML; sushy only
+# needs to insert/eject the virtual media source.
+SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = True
+
+SUSHY_EMULATOR_BOOT_LOADER_MAP = {}

@@ -58,6 +58,9 @@
     - role: haproxy
       tags: [haproxy]
 
+    - role: sushy
+      tags: [sushy]
+
     - role: storage_pool
       tags: [storage, storage_pool]
 

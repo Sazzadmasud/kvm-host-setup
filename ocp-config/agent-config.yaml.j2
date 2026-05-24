@@ -9,6 +9,11 @@ hosts:
 {% for node in control_nodes %}
   - hostname: {{ node.name }}.{{ cluster_name }}.{{ base_domain }}
     role: {{ node.role }}
+    bmc:
+      address: redfish-virtualmedia://{{ sushy_host }}:{{ sushy_port }}/redfish/v1/Systems/{{ node.name }}
+      username: admin
+      password: admin
+      disableCertificateVerification: true
     interfaces:
       - name: enp1s0
         macAddress: {{ node.mac }}
@@ -38,6 +43,11 @@ hosts:
 {% for node in worker_nodes %}
   - hostname: {{ node.name }}.{{ cluster_name }}.{{ base_domain }}
     role: {{ node.role }}
+    bmc:
+      address: redfish-virtualmedia://{{ sushy_host }}:{{ sushy_port }}/redfish/v1/Systems/{{ node.name }}
+      username: admin
+      password: admin
+      disableCertificateVerification: true
     interfaces:
       - name: enp1s0
         macAddress: {{ node.mac }}

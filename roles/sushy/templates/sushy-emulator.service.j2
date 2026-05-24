@@ -1,0 +1,15 @@
+[Unit]
+Description=Sushy Redfish Emulator (libvirt backend)
+Documentation=https://docs.openstack.org/sushy-tools/latest/
+After=virtqemud.socket network.target
+Wants=virtqemud.socket
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/sushy-venv/bin/sushy-emulator --config /etc/sushy/sushy.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

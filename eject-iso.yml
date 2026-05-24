@@ -1,43 +1,23 @@
 ---
-# Monitors RHCOS image-write progress, ejects the agent ISO from each VM as
-# soon as its disk write completes, waits for bootstrap-complete, then waits
-# for install-complete. Fixes ownership and configures KUBECONFIG on finish.
+# Waits for bootstrap-complete and install-complete after VMs are started.
+# ISO ejection is handled automatically by the assisted-service via Redfish
+# (sushy-emulator) — no manual eject step needed.
 #
 # Run this after: ansible-playbook site.yml --tags vms
 #   (or use deploy.yml which chains all steps automatically)
 #
-# Why eject early?
-#   UEFI NVRAM on KVM does not reliably honour the XML boot-order override;
-#   leaving the ISO attached causes nodes to reboot back into the installer
-#   after the disk write, stalling the install.
-#
-# Detection (first signal wins per node):
-#   1. virsh state → shut-off   (VM just rebooted after writing RHCOS to disk)
-#   2. install log → "Writing image.*100" or "Rebooting" for the node's name
-#
 # Usage:
 #   ansible-playbook eject-iso.yml
 
-- name: Eject agent ISO after RHCOS image write, then reach install-complete
+- name: Wait for OCP bootstrap-complete and install-complete
   hosts: kvm_hosts
   gather_facts: true
 
   vars:
-    eject_timeout_minutes: 45      # max wait for image writes across all nodes
     bootstrap_timeout_minutes: 90  # max wait for bootstrap-complete
     install_timeout_minutes: 60    # max wait for install-complete (cluster operators)
 
   tasks:
-    - name: Build full VM list
-      ansible.builtin.set_fact:
-        all_vm_names: "{{ (control_nodes + worker_nodes) | map(attribute='name') | list }}"
-
-    - name: Render eject-monitor script
-      ansible.builtin.template:
-        src: roles/vms/templates/eject-monitor.sh.j2
-        dest: /tmp/ocp_eject_monitor.sh
-        mode: "0755"
-
     - name: Start openshift-install agent wait-for bootstrap-complete (background)
       ansible.builtin.command: >
         /usr/local/bin/openshift-install agent wait-for bootstrap-complete
@@ -45,22 +25,6 @@
       async: "{{ bootstrap_timeout_minutes * 60 }}"
       poll: 0
       register: bootstrap_job
-
-    - name: Watch for image-write completion and eject ISO from each node
-      ansible.builtin.command: /bin/bash /tmp/ocp_eject_monitor.sh
-      register: eject_result
-      changed_when: "'ISO ejected' in eject_result.stdout"
-      failed_when: eject_result.rc != 0
-      timeout: "{{ eject_timeout_minutes * 60 + 60 }}"
-
-    - name: Show eject log
-      ansible.builtin.debug:
-        msg: "{{ eject_result.stdout_lines }}"
-
-    - name: Clean up monitor script
-      ansible.builtin.file:
-        path: /tmp/ocp_eject_monitor.sh
-        state: absent
 
     - name: Wait for bootstrap-complete
       ansible.builtin.async_status:

@@ -1,0 +1,63 @@
+---
+# Installs and configures sushy-emulator — a Redfish API emulator backed by
+# libvirt. Used by openshift-install to eject virtual media after RHCOS image
+# write, replacing the fragile virsh change-media approach.
+#
+# Each KVM VM is exposed as a Redfish System:
+#   GET  http://192.168.200.1:{{ sushy_port }}/redfish/v1/Systems/<vm-name>
+#   POST http://192.168.200.1:{{ sushy_port }}/redfish/v1/Managers/<vm-name>/VirtualMedia/Cd/Actions/VirtualMedia.EjectMedia
+
+- name: Install Python venv support
+  ansible.builtin.dnf:
+    name: python3-virtualenv
+    state: present
+
+- name: Create sushy virtualenv
+  ansible.builtin.command: python3 -m venv /opt/sushy-venv
+  args:
+    creates: /opt/sushy-venv/bin/activate
+
+- name: Install sushy-tools into virtualenv
+  ansible.builtin.pip:
+    name: sushy-tools
+    virtualenv: /opt/sushy-venv
+    state: present
+
+- name: Create sushy config directory
+  ansible.builtin.file:
+    path: /etc/sushy
+    state: directory
+    mode: "0750"
+    owner: root
+    group: root
+
+- name: Deploy sushy emulator config
+  ansible.builtin.template:
+    src: sushy.conf.j2
+    dest: /etc/sushy/sushy.conf
+    mode: "0640"
+  notify: Restart sushy-emulator
+
+- name: Deploy sushy systemd service
+  ansible.builtin.template:
+    src: sushy-emulator.service.j2
+    dest: /etc/systemd/system/sushy-emulator.service
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart sushy-emulator
+
+- name: Open sushy port in firewalld (libvirt zone — VM traffic)
+  ansible.posix.firewalld:
+    zone: libvirt
+    port: "{{ sushy_port }}/tcp"
+    permanent: true
+    state: enabled
+    immediate: true
+
+- name: Enable and start sushy-emulator
+  ansible.builtin.systemd:
+    name: sushy-emulator
+    enabled: true
+    state: started
+    daemon_reload: true
