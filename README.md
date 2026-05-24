@@ -1,35 +1,68 @@
-# KVM Host Setup for OCP 4.18 (Agent-based)
+# KVM Host Setup for OCP Agent-Based Install
 
 Ansible playbooks to configure a bare-metal KVM host and deploy OpenShift
-Container Platform 4.18 using the agent-based installation method.
+Container Platform using the agent-based installation method.
 
 ---
 
 ## Table of Contents
 
-1. [Host Specifications](#host-specifications)
-2. [Cluster Design](#cluster-design)
-3. [Architecture Overview](#architecture-overview)
-4. [Part 1 — Prerequisites](#part-1--prerequisites)
-   - [1.1 Host Hardware Verification](#11-host-hardware-verification)
-   - [1.2 KVM / libvirt Stack](#12-kvm--libvirt-stack)
-   - [1.3 Swap — Why 32 GB and Where](#13-swap--why-32-gb-and-where)
-   - [1.4 DNS — BIND9 (not libvirt dnsmasq)](#14-dns--bind9-not-libvirt-dnsmasq)
-   - [1.5 Load Balancer — HAProxy with Persistent VIPs](#15-load-balancer--haproxy-with-persistent-vips)
-   - [1.6 NetworkManager DNS Forwarding](#16-networkmanager-dns-forwarding)
-   - [1.7 Libvirt Network (DHCP only, DNS off)](#17-libvirt-network-dhcp-only-dns-off)
-5. [Part 2 — OCP Deployment](#part-2--ocp-deployment)
-   - [2.1 Wipe Everything](#21-wipe-everything)
-   - [2.2 Run Full Host Setup](#22-run-full-host-setup)
-   - [2.3 Add Your Pull Secret](#23-add-your-pull-secret)
-   - [2.4 Generate the Agent ISO](#24-generate-the-agent-iso)
-   - [2.5 Start VMs](#25-start-vms)
-   - [2.6 Monitor Bootstrap + Eject ISO](#26-monitor-bootstrap--eject-iso)
-   - [2.7 Wait for Install Complete](#27-wait-for-install-complete)
-   - [2.8 Access the Cluster](#28-access-the-cluster)
-6. [Customisation](#customisation)
-7. [Project Structure](#project-structure)
-8. [Troubleshooting](#troubleshooting)
+1. [Quick Start](#quick-start)
+2. [Host Specifications](#host-specifications)
+3. [Cluster Design](#cluster-design)
+4. [Architecture Overview](#architecture-overview)
+5. [Infrastructure Components](#infrastructure-components)
+   - [KVM / libvirt Stack](#kvm--libvirt-stack)
+   - [Swap (32 GB)](#swap-32-gb)
+   - [DNS — BIND9](#dns--bind9)
+   - [Load Balancer — HAProxy + VIPs](#load-balancer--haproxy--vips)
+   - [NetworkManager DNS Forwarding](#networkmanager-dns-forwarding)
+   - [Libvirt Network](#libvirt-network)
+   - [Redfish Emulator — sushy](#redfish-emulator--sushy)
+   - [System Sleep Prevention](#system-sleep-prevention)
+6. [OCP Deployment](#ocp-deployment)
+   - [Unattended (deploy.yml)](#unattended-deployyml)
+   - [Manual Step-by-Step](#manual-step-by-step)
+7. [Post-Install Verification](#post-install-verification)
+8. [Customisation](#customisation)
+9. [Project Structure](#project-structure)
+10. [Troubleshooting](#troubleshooting)
+
+---
+
+## Quick Start
+
+**Prerequisites (one-time):**
+
+```bash
+# 1. Passwordless sudo
+echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$USER-nopasswd
+
+# 2. Pull secret from https://console.redhat.com/openshift/install/pull-secret
+cp ~/pull-secret.json /opt/ocp/pull-secret.json
+chmod 600 /opt/ocp/pull-secret.json
+```
+
+**Full unattended install:**
+
+```bash
+cd /opt/kvm-host-setup
+ansible-playbook deploy.yml
+```
+
+`deploy.yml` chains all phases automatically:
+1. Host setup (packages, KVM, networking, DNS, HAProxy, sushy, storage)
+2. Agent ISO generation
+3. VM boot
+4. Wait for bootstrap-complete (~20 min)
+5. Wait for install-complete (~90 min)
+
+**To wipe and reinstall:**
+
+```bash
+ansible-playbook cleanup.yml -e "unattended=true"
+ansible-playbook deploy.yml
+```
 
 ---
 
@@ -38,7 +71,6 @@ Container Platform 4.18 using the agent-based installation method.
 | Property | Value |
 |---|---|
 | OS | Fedora Linux 42 |
-| Kernel | 6.19.8-100.fc42.x86_64 |
 | CPU | Intel Core i7-10710U — 6 cores / 12 threads, VT-x |
 | RAM | 62 GB |
 | Root disk | NVMe 29 GB (btrfs, `/` + `/home`) |
@@ -59,10 +91,9 @@ Container Platform 4.18 using the agent-based installation method.
 | ocp-worker-1  | worker | 4 |  8 GB | 120 GB | `52:54:00:c0:02:01` | 192.168.200.31 |
 | ocp-worker-2  | worker | 4 |  8 GB | 120 GB | `52:54:00:c0:02:02` | 192.168.200.32 |
 
-**Total VM allocation:** 3×16 + 2×8 = 64 GB on a 62 GB host. This is a
-deliberate overcommit — Linux's memory overcommit + zram + the 32 GB swapfile
-on `/opt` make it work in practice for a lab. The VMs don't all actively use
-their full allocation simultaneously during stable operation.
+**RAM overcommit:** 3×16 + 2×8 = 64 GB on a 62 GB host. The 32 GB swapfile on `/opt`
+and kernel zram provide enough headroom. VMs don't all actively use their full
+allocation simultaneously during stable operation.
 
 ### Network
 
@@ -73,10 +104,11 @@ their full allocation simultaneously during stable operation.
 | Mode | NAT |
 | Subnet | 192.168.200.0/24 |
 | Gateway | 192.168.200.1 |
-| DHCP range | 192.168.200.100–200 (nodes use static IPs, range for ad-hoc VMs) |
+| DHCP range | 192.168.200.100–200 (nodes use static IPs via NMState) |
 | API VIP | 192.168.200.10 → `api.ocp.lab.local`, `api-int.ocp.lab.local` |
 | Ingress VIP | 192.168.200.11 → `*.apps.ocp.lab.local` |
 | Cluster domain | `ocp.lab.local` |
+| Rendezvous node | ocp-control-1 (192.168.200.21) |
 
 ---
 
@@ -91,9 +123,10 @@ their full allocation simultaneously during stable operation.
 │  │          192.168.200.10/32  (API VIP)                   │   │
 │  │          192.168.200.11/32  (Ingress VIP)               │   │
 │  │                                                         │   │
-│  │  BIND9  :53   (for VMs)    :5353  (for host NM fwd)     │   │
-│  │  HAProxy :6443 :22623 :80 :443  (bound to VIPs)         │   │
-│  │  dnsmasq :67  DHCP only — DNS disabled                  │   │
+│  │  BIND9        :53   (VMs)  :5353 (host NM forwarding)  │   │
+│  │  HAProxy      :6443 :22623 :80 :443  (bound to VIPs)   │   │
+│  │  sushy-emul.  :8000  (Redfish for assisted-service)     │   │
+│  │  dnsmasq      :67   DHCP only — DNS disabled            │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │          │ vnet1   │ vnet3   │ vnet4   │ vnet5   │ vnet6        │
 │          ▼         ▼         ▼         ▼         ▼              │
@@ -102,212 +135,115 @@ their full allocation simultaneously during stable operation.
 │  │.21       │ │.22       │ │.23       │ │.31   │ │.32   │     │
 │  └──────────┘ └──────────┘ └──────────┘ └──────┘ └──────┘     │
 │                                                                 │
-│  Host DNS query path:                                           │
-│    app → NM dnsmasq (127.0.0.1:53)                              │
-│         → ocp.lab.local? forward to BIND (127.0.0.1:5353)      │
-│         → other? forward to internet                            │
-│                                                                 │
-│  VM DNS query path:                                             │
-│    VM → BIND (192.168.200.1:53) — direct, no proxy             │
+│  Host DNS:  app → NM dnsmasq (127.0.0.1:53)                    │
+│                → ocp.lab.local? → BIND9 (127.0.0.1:5353)       │
+│                → other?         → internet                      │
+│  VM DNS:    VM → BIND9 (192.168.200.1:53) — direct             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Part 1 — Prerequisites
+## Infrastructure Components
 
-This section explains **what the Ansible roles configure and why** before any
-OCP deployment begins. Running `ansible-playbook site.yml` (excluding `--tags
-vms`) sets all of this up automatically.
+### KVM / libvirt Stack
 
----
+**Roles:** `packages`, `libvirt_setup`
 
-### 1.1 Host Hardware Verification
-
-**Role:** `pre_tasks` in `site.yml`
-
-Before anything runs, the playbook asserts:
-
-- **KVM support**: `/proc/cpuinfo` must contain `vmx` (Intel VT-x) or `svm`
-  (AMD-V). Without hardware virtualisation OCP nodes cannot boot.
-- **Minimum RAM**: 48 GB. The cluster needs 64 GB allocated across 5 VMs;
-  the host needs to support that with overcommit.
-- **`/opt` space**: Minimum 500 GB free. VM disk images (5 × 120 GB = 600 GB
-  nominal, ~10–20 GB actual on thin-provisioned qcow2), the agent ISO (~1.4 GB),
-  the 32 GB swapfile, and install artifacts all live here.
-
----
-
-### 1.2 KVM / libvirt Stack
-
-**Role:** `packages`, `libvirt_setup`
-
-**What is installed:**
-
+**Packages installed:**
 ```
 qemu-kvm  qemu-img  libvirt  libvirt-client
 libvirt-daemon-driver-{qemu,network,storage-core,storage-logical}
-virt-install  python3-libvirt  python3-lxml
+virt-install  python3-libvirt  python3-lxml  python3-virtualenv
 bind  bind-utils  dnsmasq  haproxy  nmstate
 openshift-install  oc  kubectl
 ```
 
-**Fedora 42 uses modular libvirt daemons.** Fedora 38+ replaced the
-single `libvirtd` process with socket-activated micro-daemons. The sockets
-that must be enabled are:
+**Fedora 42 modular libvirt daemons.** The sockets that must be enabled:
 
 | Socket | Purpose |
 |---|---|
 | `virtqemud.socket` | QEMU hypervisor driver |
-| `virtnetworkd.socket` | Network (bridge, NAT, DNS/DHCP) |
+| `virtnetworkd.socket` | Network (bridge, NAT, DHCP) |
 | `virtstoraged.socket` | Storage pool management |
 | `virtnodedevd.socket` | Host device enumeration |
-| `virtsecretd.socket` | Secrets (used by LUKS) |
+| `virtsecretd.socket` | Secrets |
 | `virtlogd.socket` | Console log forwarding |
 
-If only `libvirtd.socket` is enabled (the old monolithic path), `virsh
--c qemu:///system` may work but `virtnetworkd` won't be managing networks,
-causing stale PID files and bridge conflicts on cleanup. See [T4](#t4).
-
-**QEMU configuration changes** (`/etc/libvirt/qemu.conf`):
+**QEMU configuration** (`/etc/libvirt/qemu.conf`):
 
 | Setting | Value | Reason |
 |---|---|---|
-| `security_driver` | `none` | Disables sVirt/SELinux labelling — simplifies lab setup |
-| `user` | `root` | Needed to read qcow2 images in `/opt/images` |
-| `group` | `kvm` | Shared access to KVM device nodes |
+| `security_driver` | `none` | Disables sVirt/SELinux labelling |
+| `user` | `root` | Read qcow2 images in `/opt/images` |
+| `group` | `kvm` | Access to KVM device nodes |
 | `dynamic_ownership` | `1` | QEMU can chown disk images at runtime |
+
+**VM disk cache:** The VM template uses `cache='unsafe' io='threads'` on the boot disk. This makes guest `fdatasync` a no-op on the host, which is required for the RHCOS `installation-disk-speed-check` to pass. See [T7](#t7-installation-disk-speed-check-timeout).
+
+**UEFI boot order:** VM XML sets the boot disk (`vda`) as boot order 1 and the agent ISO (`sda`) as boot order 2. On first boot the empty disk falls through to the ISO; after coreos-installer writes RHCOS with an EFI bootloader, every subsequent boot uses the disk automatically. **The ISO never needs to be ejected.**
 
 ---
 
-### 1.3 Swap — Why 32 GB and Where
+### Swap (32 GB)
 
 **Role:** `swap`
 
-**The problem:** The 5 VMs collectively allocate 64 GB of RAM on a 62 GB
-host. Without sufficient swap, any mmap that the kernel cannot back with
-physical pages causes a `SIGSEGV` (exit 139) inside the guest process — not an
-OOM kill, just a silent crash. This was observed as `openshift-apiserver`
-crashing on control-3 with exit code 139 during the initial install attempt.
+The 5 VMs allocate 64 GB on a 62 GB host. Without sufficient swap, anonymous mmaps
+that the kernel cannot back with physical pages cause `SIGSEGV` (exit 139) inside
+guest Go processes — observed as `openshift-apiserver` crashing on a control node.
 
-**The solution:** A 32 GB swapfile on `/opt` (which has 529 GB free on the
-data SSD). The host also has an 8 GB zram swap device (priority 100, used
-first due to compression). Combined, the host has ~40 GB of swap, enough
-headroom for the overcommit.
-
-**What the role does:**
-
-1. Creates `/opt/swapfile` (32 GB, `dd` if it doesn't exist)
-2. Formats it as swap (`mkswap`)
-3. Activates it (`swapon`)
-4. Adds it to `/etc/fstab` for persistence across reboots:
-   ```
-   /opt/swapfile swap swap defaults 0 0
-   ```
-
-**Why `/opt` and not `/`?** The root NVMe partition is only 29 GB (btrfs).
-`/opt` is on the 733 GB data SSD with over 500 GB free.
+The role creates `/opt/swapfile` (32 GB), formats and activates it, and adds it
+to `/etc/fstab`. Combined with the kernel's 8 GB zram device (priority 100),
+the host has ~40 GB total swap.
 
 ---
 
-### 1.4 DNS — BIND9 (not libvirt dnsmasq)
+### DNS — BIND9
 
 **Role:** `dns`, `nm_dns`
 
-This is the most important prerequisite to get right. DNS problems cause
-cascading failures in OCP that are very difficult to diagnose.
+BIND9 is authoritative for `ocp.lab.local`. It returns `NXDOMAIN` for unknown
+names and `NOERROR` with empty answer for AAAA queries — no forwarding, no loops.
 
-#### Why not libvirt's built-in dnsmasq?
+**Why not libvirt's dnsmasq?** libvirt dnsmasq + OCP's `ndots:5` resolv.conf
+creates a AAAA query loop that causes 5-second timeouts for every OCP operator
+HTTP call. BIND9 eliminates this entirely.
 
-libvirt's dnsmasq is sufficient for basic A record resolution. The problems
-appear when OCP is running:
-
-**Problem: AAAA query loop causing timeouts**
-
-OCP pods run with `ndots:5` in their `/etc/resolv.conf`. This makes the Go
-HTTP client (used by almost every OCP operator) issue both A and AAAA queries
-for every hostname. When AAAA queries hit libvirt's dnsmasq, the following
-loop forms:
-
-```
-Pod DNS query: oauth-openshift.apps.ocp.lab.local AAAA
-  → CoreDNS (on node) → forwards to node resolver (192.168.200.1)
-  → libvirt dnsmasq → doesn't have AAAA, forwards upstream → 127.0.0.1
-  → NM dnsmasq → server=/ocp.lab.local/192.168.200.1 → back to libvirt dnsmasq
-  → loop → timeout after 5 seconds
-```
-
-The `filter-AAAA` dnsmasq option was tried but it only suppresses forwarding
-to the *default* upstream resolver. It does **not** suppress forwarding to
-domain-specific `server=` entries — so the loop persists for all
-`*.ocp.lab.local` names.
-
-`local=/ocp.lab.local/` (mark the domain as locally authoritative, never
-forward) was also tried. This requires a full daemon restart to take effect
-(SIGHUP only re-reads hosts files, not the main config), and restarting the
-libvirt dnsmasq while VMs are running is disruptive.
-
-**The fix: BIND9**
-
-BIND9 is authoritative for `ocp.lab.local`. It returns `NXDOMAIN` instantly
-for unknown names (no forwarding to any upstream), and returns `NOERROR` with
-empty answer section for AAAA queries against A-only names. No loops, no
-timeouts.
-
-#### What BIND9 serves
-
-Zone: `ocp.lab.local`
+**Zone records:**
 
 | Name | Type | Value |
 |---|---|---|
-| `api.ocp.lab.local` | A | 192.168.200.10 (API VIP) |
-| `api-int.ocp.lab.local` | A | 192.168.200.10 (same VIP, internal alias) |
-| `*.apps.ocp.lab.local` | A | 192.168.200.11 (Ingress VIP, wildcard) |
+| `api.ocp.lab.local` | A | 192.168.200.10 |
+| `api-int.ocp.lab.local` | A | 192.168.200.10 |
+| `*.apps.ocp.lab.local` | A | 192.168.200.11 |
 | `ocp-control-{1,2,3}.ocp.lab.local` | A | 192.168.200.{21,22,23} |
 | `ocp-worker-{1,2}.ocp.lab.local` | A | 192.168.200.{31,32} |
 
-**`api-int` is critical.** During first boot, RHCOS fetches its ignition
-config from `https://api-int.ocp.lab.local:22623/config/master`. If this name
-doesn't resolve, ignition fails silently — the node boots with no SSH keys,
-no kubelet, and can never join the cluster. See [T11](#t11).
+**`api-int` is critical.** RHCOS first-boot fetches ignition config from
+`https://api-int.ocp.lab.local:22623/config/master`. If this name does not
+resolve, the node boots without SSH keys or kubelet and can never join the cluster.
 
-#### How BIND9 listens
-
-BIND9 listens on two addresses and two ports:
+**Listen addresses:**
 
 | Address:Port | Purpose |
 |---|---|
-| `192.168.200.1:53` | Direct DNS for all VMs (DHCP tells VMs to use this) |
+| `192.168.200.1:53` | Direct DNS for all VMs |
 | `127.0.0.1:5353` | For NM dnsmasq to forward `*.ocp.lab.local` from the host |
 
-`127.0.0.1:53` is **not** used by BIND9 — that port belongs to NM's own
-dnsmasq process.
+BIND9 has a systemd drop-in (`After=libvirtd.service`) so it starts after `virbr4`
+exists. The libvirt network hook also restarts `named` after binding VIPs.
 
-#### Startup order
-
-BIND9 must start *after* `virbr4` exists (otherwise it cannot bind to
-`192.168.200.1:53`). The `dns` role adds a systemd drop-in:
-
-```ini
-# /etc/systemd/system/named.service.d/after-libvirt.conf
-[Unit]
-After=libvirtd.service
-
-[Service]
-Restart=on-failure
-RestartSec=5
+**Host NM forwarding** (`/etc/NetworkManager/dnsmasq.d/ocp.conf`):
 ```
-
-The libvirt network hook (see §1.5) also calls `systemctl restart named`
-after binding VIPs, as a belt-and-suspenders measure.
+server=/ocp.lab.local/127.0.0.1#5353
+```
 
 ---
 
-### 1.5 Load Balancer — HAProxy with Persistent VIPs
+### Load Balancer — HAProxy + VIPs
 
-**Role:** `haproxy`, `vip`
-
-#### What HAProxy does
+**Roles:** `haproxy`, `vip`
 
 HAProxy load-balances four services:
 
@@ -318,40 +254,18 @@ HAProxy load-balances four services:
 | Ingress HTTP | 192.168.200.11:80 | worker-{1,2}:80 |
 | Ingress HTTPS | 192.168.200.11:443 | worker-{1,2}:443 |
 
-HAProxy runs on the KVM host (not in a VM). It binds to the specific VIP
-addresses, not `*:port`. This prevents port conflicts with other host services
-and makes the binding intent explicit.
+**VIP persistence via libvirt network hook** (`/etc/libvirt/hooks/network`):
 
-#### Why VIPs must be explicitly assigned to virbr4
-
-A VM sending a packet to `192.168.200.10` does a broadcast ARP request:
-*"Who has 192.168.200.10?"* If no interface on the host has that address, the
-ARP goes unanswered, the VM never gets a MAC address for the gateway, and the
-TCP connection never establishes — even though HAProxy is listening.
-
-The VIPs must be secondary addresses on `virbr4` so the host responds to ARP
-and HAProxy receives the traffic.
-
-#### How VIPs are made persistent (libvirt network hook)
-
-Previous attempts used:
-- Manual `ip addr add` — lost on reboot
-- NetworkManager dispatcher script — does not fire for `virbr*` interfaces
-  (NM explicitly ignores them via the `99-libvirt.conf` unmanaged-devices rule)
-
-The correct mechanism is a **libvirt network hook**:
-`/etc/libvirt/hooks/network`
-
-Libvirt calls this script every time any network changes state. The hook binds
-the VIPs when `labnet` starts and removes them when it stops:
+VIPs must be secondary addresses on `virbr4` for ARP to work. NetworkManager
+ignores `virbr*` interfaces, so a libvirt network hook binds and removes VIPs
+as `labnet` starts and stops. This runs automatically on every boot.
 
 ```bash
 case "$NETWORK/$ACTION" in
     labnet/started)
         ip addr add 192.168.200.10/32 dev virbr4
         ip addr add 192.168.200.11/32 dev virbr4
-        sleep 1
-        systemctl restart named   # BIND can now bind to 192.168.200.1:53
+        sleep 1 && systemctl restart named
         ;;
     labnet/stopped)
         ip addr del 192.168.200.10/32 dev virbr4
@@ -360,323 +274,271 @@ case "$NETWORK/$ACTION" in
 esac
 ```
 
-This runs automatically on every boot when libvirtd autostart brings up
-`labnet`. No manual intervention needed.
-
-#### HAProxy startup order
-
-HAProxy binds to the VIPs. The VIPs only exist after the libvirt hook runs.
-The `haproxy` role adds a systemd drop-in:
-
-```ini
-# /etc/systemd/system/haproxy.service.d/after-libvirt.conf
-[Unit]
-After=libvirtd.service
-
-[Service]
-Restart=on-failure
-RestartSec=5
-```
-
-If HAProxy starts before the hook finishes, it restarts automatically and
-succeeds on the next attempt.
+HAProxy has a systemd drop-in (`After=libvirtd.service, Restart=on-failure`)
+so it retries if it starts before the VIPs are bound.
 
 ---
 
-### 1.6 NetworkManager DNS Forwarding
-
-**Role:** `nm_dns`
-
-The KVM host uses NetworkManager with dnsmasq mode for its own DNS resolution
-(`/etc/NetworkManager/conf.d/01-dnsmasq.conf`). NM dnsmasq runs on
-`127.0.0.1:53` and handles all host DNS queries.
-
-For OCP names, NM dnsmasq needs to forward to BIND9. The config
-`/etc/NetworkManager/dnsmasq.d/ocp.conf` contains:
-
-```
-server=/ocp.lab.local/127.0.0.1#5353
-```
-
-This forwards all `*.ocp.lab.local` queries (including `*.apps.ocp.lab.local`
-which is a subdomain) to BIND9 on port 5353. BIND9 answers authoritatively —
-no further forwarding, no loops.
-
-External names (internet) are forwarded by NM dnsmasq to the upstream
-resolver from the active network connection (wifi in this case).
-
----
-
-### 1.7 Libvirt Network (DHCP only, DNS off)
+### Libvirt Network
 
 **Role:** `networks`
 
-The `labnet` network definition has DNS **disabled**:
+The `labnet` network has DNS **disabled** (`<dns enable='no'/>`), which prevents
+libvirt's dnsmasq from binding to `192.168.200.1:53` ahead of BIND9. Dnsmasq
+only handles DHCP. VMs are told to use BIND9 via a DHCP option:
 
 ```xml
-<dns enable='no'/>
+<dnsmasq:option value='dhcp-option=option:dns-server,192.168.200.1'/>
 ```
 
-Without this, libvirt's dnsmasq would bind to `192.168.200.1:53` and prevent
-BIND9 from binding there. With DNS disabled, dnsmasq only handles DHCP.
-
-VMs are told to use BIND9 for DNS via a DHCP option:
-
-```xml
-<dnsmasq:options>
-  <dnsmasq:option value='dhcp-option=option:dns-server,192.168.200.1'/>
-</dnsmasq:options>
-```
-
-This injects `option 6` (DNS server) into every DHCP offer, overriding the
-default (which would be the gateway itself acting as DNS). VMs receive their
-IP from DHCP but query BIND9 directly for all DNS.
-
-Note: OCP node IPs are static (configured via NMState in `agent-config.yaml`),
-not from DHCP. The DHCP option is still sent in the DISCOVER/OFFER exchange;
-NMState picks it up and writes it to the node's `resolv.conf`.
+Node IPs are static (configured via NMState in `agent-config.yaml`), but the
+DHCP option is still delivered during DISCOVER/OFFER and NMState uses it
+when writing the node's `resolv.conf`.
 
 ---
 
-## Part 2 — OCP Deployment
+### Redfish Emulator — sushy
 
-With all prerequisites in place (either from a fresh `site.yml` run or
-verified manually), follow these steps in order.
+**Role:** `sushy`
 
----
+[sushy-tools](https://opendev.org/openstack/sushy-tools) is an OpenStack Redfish
+API emulator backed by libvirt. It exposes each KVM VM as a Redfish System at:
 
-### 2.1 Wipe Everything
+```
+http://192.168.200.1:8000/redfish/v1/Systems/<vm-name>
+```
 
-If there is a previous install (VMs, networks, images) that needs to be
-removed first:
+This allows `openshift-install` to communicate with the assisted-service using
+a `redfish-virtualmedia://` BMC address in `agent-config.yaml`, which is the
+standard interface for assisted installs.
+
+**Critical venv setup:** sushy requires `python3-libvirt` (system package).
+The virtualenv must be created with `--system-site-packages` so it can see the
+system libvirt bindings:
 
 ```bash
-cd /opt/kvm-host-setup
-ansible-playbook cleanup.yml
+python3 -m venv --system-site-packages /opt/sushy-venv
 ```
 
-This destroys and undefines all VMs (with `--nvram --remove-all-storage`),
-destroys and undefines all libvirt networks and storage pools, kills any stale
-dnsmasq processes left by the old monolithic libvirtd, removes stale bridge
-and tap interfaces, wipes `/opt/images`, `/opt/ocp`, and `/opt/ocp-build`,
-vacuums the systemd journal to 200 MB, and cleans the dnf cache.
+Without `--system-site-packages`, sushy logs `libvirt driver not loaded` and
+cannot enumerate VMs.
 
-**Warning:** This removes everything including all VM disk data. There is no
-confirmation prompt — run it only when you mean it.
+**Config** (`/etc/sushy/sushy.conf`):
+
+```python
+SUSHY_EMULATOR_LISTEN_IP = '0.0.0.0'
+SUSHY_EMULATOR_LISTEN_PORT = 8000
+SUSHY_EMULATOR_LIBVIRT_URI = 'qemu:///system'
+SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = True   # VM XML controls boot order
+```
+
+`SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = True` lets the VM XML control boot order
+rather than having sushy manipulate EFI NVRAM, which keeps the boot order fix
+(disk=1, ISO=2) intact.
+
+Verify sushy is working:
+```bash
+curl -s http://192.168.200.1:8000/redfish/v1/Systems/ | python3 -m json.tool
+```
 
 ---
 
-### 2.2 Run Full Host Setup
+### System Sleep Prevention
+
+The KVM host must not suspend during a long OCP install. GNOME's default
+15-minute suspend timeout has caused SSH disconnections and interrupted deploys.
+
+**One-time host configuration:**
+
+```bash
+# GNOME power settings
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 0
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+gsettings set org.gnome.desktop.session idle-delay 0
+
+# Mask systemd sleep targets
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+# Prevent logind from suspending on lid close / key press
+sudo tee /etc/systemd/logind.conf.d/nosleep.conf <<'EOF'
+[Login]
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+IdleAction=ignore
+EOF
+sudo systemctl restart systemd-logind
+```
+
+Verify:
+```bash
+systemctl is-active sleep.target      # → inactive (masked)
+systemctl is-active suspend.target    # → inactive (masked)
+```
+
+---
+
+## OCP Deployment
+
+### Unattended (deploy.yml)
+
+The recommended path for a complete install from scratch:
+
+```bash
+# Prerequisites verified — then:
+ansible-playbook deploy.yml
+```
+
+`deploy.yml` runs four phases in sequence:
+1. `site.yml` — full host setup (packages through storage pool; VMs deferred)
+2. `generate-ocp-config.yml` — render configs, generate agent ISO
+3. Start all 5 VMs
+4. `eject-iso.yml` — wait for bootstrap-complete, then install-complete
+
+Total time: approximately 2–2.5 hours from a clean host.
+
+---
+
+### Manual Step-by-Step
+
+Use this when you need to run phases independently or troubleshoot.
+
+#### Step 1 — Wipe Everything (if reinstalling)
+
+```bash
+ansible-playbook cleanup.yml
+# or unattended:
+ansible-playbook cleanup.yml -e "unattended=true"
+```
+
+Destroys all VMs, networks, pools, and wipes `/opt/ocp/cluster`. Does not
+remove `/opt/ocp/pull-secret.json`.
+
+#### Step 2 — Host Setup
 
 ```bash
 ansible-playbook site.yml --skip-tags vms
 ```
 
-This configures the entire host in order:
-
-1. **packages** — installs KVM stack, BIND, HAProxy, nmstate, openshift-install, oc
-2. **swap** — creates and activates the 32 GB swapfile, adds to fstab
-3. **libvirt_setup** — enables modular daemons, configures qemu.conf
-4. **networks** — defines `labnet` (NAT, DNS off, DHCP with DNS option)
-5. **dns** — deploys named.conf + zone file, opens libvirt firewalld zone for DNS
-6. **nm_dns** — writes NM dnsmasq forwarding config for `ocp.lab.local`
-7. **vip** — deploys the libvirt network hook, binds VIPs immediately
-8. **haproxy** — deploys haproxy.cfg, opens firewalld ports, enables service
-9. **storage_pool** — creates `/opt/images` storage pool in libvirt
+Configures in order: packages → swap → libvirt → networks → DNS → NM DNS →
+VIPs → HAProxy → sushy → storage pool.
 
 Individual roles can be re-run with tags:
-
 ```bash
-ansible-playbook site.yml --tags dns          # re-deploy BIND config only
-ansible-playbook site.yml --tags haproxy      # re-deploy HAProxy config only
-ansible-playbook site.yml --tags networks     # re-define labnet
+ansible-playbook site.yml --tags dns       # re-deploy BIND config only
+ansible-playbook site.yml --tags haproxy   # re-deploy HAProxy config only
+ansible-playbook site.yml --tags sushy     # re-deploy sushy emulator
 ```
 
-**Verify the prerequisites before continuing:**
-
+**Verify before continuing:**
 ```bash
-# BIND is running and serving all required names
-dig api.ocp.lab.local A +short           # → 192.168.200.10
-dig api-int.ocp.lab.local A +short       # → 192.168.200.10
-dig ocp-control-1.ocp.lab.local A +short # → 192.168.200.21
-dig anything.apps.ocp.lab.local A +short # → 192.168.200.11
+# DNS
+dig api.ocp.lab.local A +short            # → 192.168.200.10
+dig api-int.ocp.lab.local A +short        # → 192.168.200.10
+dig anything.apps.ocp.lab.local A +short  # → 192.168.200.11
+dig ocp-control-1.ocp.lab.local A +short  # → 192.168.200.21
+dig api.ocp.lab.local AAAA +time=2        # → NOERROR, empty (no timeout)
 
-# AAAA queries return immediately (no timeout)
-dig api.ocp.lab.local AAAA +time=2       # → NOERROR, empty answer
-dig foo.ocp.lab.local AAAA +time=2       # → NXDOMAIN
-
-# VIPs are on virbr4
+# VIPs
 ip addr show virbr4 | grep '192.168.200.1[01]'
 
-# HAProxy is running and config is valid
+# HAProxy
 haproxy -c -f /etc/haproxy/haproxy.cfg && echo "config OK"
 systemctl is-active haproxy
 
-# Swap is active and in fstab
+# sushy
+curl -s http://192.168.200.1:8000/redfish/v1/Systems/ | python3 -m json.tool
+
+# Swap
 swapon --show
 grep swapfile /etc/fstab
 ```
 
----
-
-### 2.3 Add Your Pull Secret
-
-Download your pull secret from
-[console.redhat.com/openshift/install/pull-secret](https://console.redhat.com/openshift/install/pull-secret)
-and copy it to the expected location:
+#### Step 3 — Pull Secret
 
 ```bash
 cp ~/pull-secret.json /opt/ocp/pull-secret.json
 chmod 600 /opt/ocp/pull-secret.json
 
-# Verify it is valid JSON with the correct keys
+# Verify
 python3 -c "
-import json
-ps = json.load(open('/opt/ocp/pull-secret.json'))
+import json; ps = json.load(open('/opt/ocp/pull-secret.json'))
 print('Keys:', list(ps['auths'].keys()))
 "
 ```
 
-Expected output:
-```
-Keys: ['cloud.openshift.com', 'quay.io', 'registry.connect.redhat.com', 'registry.redhat.io']
-```
-
----
-
-### 2.4 Generate the Agent ISO
-
-This renders `install-config.yaml` and `agent-config.yaml` from Jinja2
-templates (using variables from `group_vars/all.yml`), then calls
-`openshift-install agent create image` to produce the boot ISO.
+#### Step 4 — Generate Agent ISO
 
 ```bash
 ansible-playbook generate-ocp-config.yml
 ```
 
-The ISO is written to `/opt/ocp/cluster/agent.x86_64.iso` (~1.4 GB).
-`openshift-install` also writes a `auth/` directory with the kubeconfig and
-kubeadmin password.
+Renders `install-config.yaml` and `agent-config.yaml` from Jinja2 templates,
+then calls `openshift-install agent create image`. The ISO is written to
+`/opt/ocp/cluster/agent.x86_64.iso` (~1.4 GB).
 
-To override variables without editing `all.yml`:
-```bash
-ansible-playbook generate-ocp-config.yml \
-  -e "cluster_name=mycluster base_domain=example.com"
-```
+All 5 VMs boot the **same** ISO. The agent on each node matches its MAC address
+to determine its role, static IP, and whether it is the rendezvous node
+(control-1, 192.168.200.21, which hosts the bootstrap cluster).
 
-**What the ISO contains:**
-
-- A minimal RHCOS (Red Hat CoreOS) live image
-- Embedded `install-config.yaml` and `agent-config.yaml`
-- NMState network configuration (static IPs, DNS, routes) for every node
-- Ignition config pre-staged for first-boot
-
-All 5 VMs boot the **same** ISO. The agent-service on each node reads the
-embedded config, matches the node's MAC address to determine its role and IP,
-and configures itself accordingly. The first node to boot (`ocp-control-1`
-at `192.168.200.21`, the `rendezvousIP`) hosts the bootstrap cluster until
-etcd quorum is established.
-
----
-
-### 2.5 Start VMs
+#### Step 5 — Start VMs
 
 ```bash
 ansible-playbook site.yml --tags vms
 ```
 
-The `vms` role creates 120 GB thin-provisioned qcow2 disk images in
-`/opt/images/`, defines VM XML with the correct MAC addresses and ISO attached
-as boot device, and starts all 5 VMs.
+Creates 120 GB thin-provisioned qcow2 images in `/opt/images/`, defines VMs
+with the agent ISO attached, and starts all 5 nodes. UEFI boot order: disk=1
+(empty, falls through), ISO=2 (boots the agent installer).
 
-VM disk performance note: the XML template uses `cache='unsafe' io='threads'`
-for the disk. This makes guest `fdatasync` calls a no-op on the host, which is
-required for the RHCOS `installation-disk-speed-check` to pass. The fio test
-that OCP runs (`fio --rw=write --ioengine=sync --fdatasync=1`) fails with
-`cache='none'` (too slow) and `cache='writeback'` (passes first round, fails
-subsequent rounds as HDD contention builds). See [T8](#t8).
-
----
-
-### 2.6 Monitor Bootstrap + Eject ISO
-
-Run this **immediately after starting the VMs**, in a separate terminal:
+#### Step 6 — Wait for Bootstrap + Install Complete
 
 ```bash
 ansible-playbook eject-iso.yml
 ```
 
-This playbook does two things in parallel:
+Runs `openshift-install agent wait-for bootstrap-complete` (up to 90 min),
+then `wait-for install-complete` (up to 120 min). No ISO ejection is needed —
+after coreos-installer writes RHCOS, the disk's EFI bootloader takes over on
+every subsequent reboot automatically.
 
-1. **Starts `openshift-install agent wait-for bootstrap-complete`** — so the
-   install log is streaming and the playbook exits cleanly when bootstrap is
-   reached.
-
-2. **Monitors each VM and ejects the agent ISO** the moment RHCOS finishes
-   writing itself to disk. Detection uses two parallel signals (first one wins
-   per node):
-   - The install log matches `Host: <name>.*Writing image.*100` or
-     `Host: <name>.*Rebooting`
-   - The virsh domain state transitions to `shut-off` (post-write reboot)
-
-**Why ejecting is necessary:** After RHCOS writes to disk, the node reboots.
-On UEFI KVM VMs, the boot order in XML is not reliably honoured — the VM can
-boot from the ISO again instead of the disk. This causes:
-```
-Expected the host to boot from disk, but it booted the installation image
-```
-…and the install stalls. Ejecting the ISO before the reboot forces disk boot.
-
-If a node does accidentally reboot into the ISO before ejection, recover
-manually:
-```bash
-sudo virsh -c qemu:///system change-media ocp-control-1 sda --eject --live --config
-sudo virsh -c qemu:///system reboot ocp-control-1
-```
-
-Bootstrap completes in approximately 15–20 minutes after VM start.
-
----
-
-### 2.7 Wait for Install Complete
-
-After bootstrap-complete is logged, run:
-
-```bash
-openshift-install --dir=/opt/ocp/cluster agent wait-for install-complete \
-  --log-level=info
-```
-
-This waits for all cluster operators to become available and the cluster
-version to report `Completed`. Total time from VM start is approximately
-45–60 minutes.
-
-While waiting, you can watch operator status:
+While waiting, monitor operator status in another terminal:
 ```bash
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
-watch -n10 "oc get co | grep -v 'True.*False.*False'"
+watch -n15 "oc get co | grep -v 'True.*False.*False'"
 ```
-
-A healthy cluster has all operators `Available=True`, `Progressing=False`,
-`Degraded=False`.
 
 ---
 
-### 2.8 Access the Cluster
+## Post-Install Verification
+
+Run these checks after `eject-iso.yml` completes:
 
 ```bash
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
 
-oc get nodes          # all 5 nodes, Ready
-oc get co             # all operators available
+# All 5 nodes Ready
+oc get nodes
 
-# kubeadmin password
+# All operators Available=True, Progressing=False, Degraded=False
+oc get co
+
+# No stuck pods
+oc get pods -A | grep -v -E 'Running|Completed'
+
+# Cluster version
+oc get clusterversion
+
+# kubeadmin credentials
 cat /opt/ocp/cluster/auth/kubeadmin-password
+
+# Web console
+echo "https://console-openshift-console.apps.ocp.lab.local"
 ```
 
-Web console: `https://console-openshift-console.apps.ocp.lab.local`
-
-Add to your workstation's `/etc/hosts` if accessing from outside the KVM host:
+**Access from outside the KVM host** — add to workstation `/etc/hosts`:
 ```
 192.168.200.10  api.ocp.lab.local api-int.ocp.lab.local
 192.168.200.11  console-openshift-console.apps.ocp.lab.local oauth-openshift.apps.ocp.lab.local
@@ -692,19 +554,20 @@ All tunable values live in [group_vars/all.yml](group_vars/all.yml):
 |---|---|---|
 | `cluster_name` | `ocp` | OCP cluster name |
 | `base_domain` | `lab.local` | Base DNS domain |
-| `ocp_version` | `4.18` | Used for client binary downloads |
+| `ocp_version` | `4.18` | Version for binary downloads |
 | `api_vip` | `192.168.200.10` | API load-balancer VIP |
 | `ingress_vip` | `192.168.200.11` | Ingress/router VIP |
 | `ocp_network_cidr` | `192.168.200.0/24` | Machine network |
-| `ocp_network_gateway` | `192.168.200.1` | Bridge IP, DHCP server, BIND9 address |
+| `ocp_network_gateway` | `192.168.200.1` | Bridge IP, DHCP server, BIND9 |
 | `control_vm_vcpus` | `4` | vCPUs per control node |
-| `control_vm_ram_mb` | `16384` | RAM per control node (MB) — OCP minimum is 16384 |
+| `control_vm_ram_mb` | `16384` | RAM per control node (OCP minimum) |
 | `control_vm_disk_gb` | `120` | Disk per control node |
 | `worker_vm_vcpus` | `4` | vCPUs per worker |
-| `worker_vm_ram_mb` | `8192` | RAM per worker (MB) |
+| `worker_vm_ram_mb` | `8192` | RAM per worker |
 | `worker_vm_disk_gb` | `120` | Disk per worker |
-| `libvirt_storage_pool_path` | `/opt/images` | Where qcow2 images are stored |
+| `libvirt_storage_pool_path` | `/opt/images` | qcow2 image directory |
 | `ocp_install_dir` | `/opt/ocp/cluster` | openshift-install working directory |
+| `sushy_port` | `8000` | sushy-emulator listen port |
 
 ---
 
@@ -712,7 +575,7 @@ All tunable values live in [group_vars/all.yml](group_vars/all.yml):
 
 ```
 kvm-host-setup/
-├── ansible.cfg                          # Inventory path, become, callbacks
+├── ansible.cfg                          # Inventory, become, callbacks
 ├── inventory/hosts.yml                  # kvm_host → localhost
 ├── group_vars/all.yml                   # All variables — edit this file
 │
@@ -725,7 +588,7 @@ kvm-host-setup/
 │   ├── dns/
 │   │   ├── tasks/main.yml               # BIND9 deploy + named systemd override
 │   │   ├── templates/named.conf.j2      # BIND options + zone declaration
-│   │   └── templates/ocp.lab.local.zone.j2  # Zone file: VIPs, nodes, wildcard
+│   │   └── templates/ocp.lab.local.zone.j2
 │   ├── nm_dns/
 │   │   ├── tasks/main.yml               # NM dnsmasq forwarding config
 │   │   └── templates/ocp.conf.j2        # server=/ocp.lab.local/127.0.0.1#5353
@@ -735,322 +598,242 @@ kvm-host-setup/
 │   ├── haproxy/
 │   │   ├── tasks/main.yml               # HAProxy systemd override + config
 │   │   └── templates/haproxy.cfg.j2     # VIP-bound frontends for API + ingress
+│   ├── sushy/
+│   │   ├── tasks/main.yml               # Install sushy-tools venv, service
+│   │   ├── handlers/main.yml            # Reload systemd, restart sushy-emulator
+│   │   ├── templates/sushy.conf.j2      # Redfish emulator config
+│   │   └── templates/sushy-emulator.service.j2
 │   ├── storage_pool/tasks/main.yml      # /opt/images pool in libvirt
 │   └── vms/
 │       ├── tasks/main.yml               # Disk images + VM XML + start
-│       └── templates/
-│           ├── vm.xml.j2                # VM definition (q35, UEFI, cache=unsafe)
-│           └── eject-monitor.sh.j2      # ISO eject monitor script
+│       └── templates/vm.xml.j2          # VM: q35, UEFI, disk=1/ISO=2, cache=unsafe
 │
 ├── ocp-config/
 │   ├── install-config.yaml.j2           # Cluster config (network, replicas)
-│   └── agent-config.yaml.j2             # Per-node NMState static IP + DNS
+│   └── agent-config.yaml.j2             # Per-node NMState static IP + BMC
 │
 ├── site.yml                             # Full host setup
-├── cleanup.yml                          # Wipe-only playbook
-├── generate-ocp-config.yml             # Render configs + run openshift-install
-└── eject-iso.yml                        # Monitor image-write + eject + bootstrap-complete
+├── deploy.yml                           # Unattended end-to-end deploy
+├── cleanup.yml                          # Wipe VMs, networks, install dirs
+├── generate-ocp-config.yml              # Render configs + openshift-install create image
+└── eject-iso.yml                        # Wait for bootstrap-complete + install-complete
 ```
 
 ---
 
 ## Troubleshooting
 
-### [T1] `Invalid callback for stdout specified: yaml`
+### T1 — `Invalid callback for stdout specified: yaml`
 
-**Symptom:**
 ```
 ERROR! Invalid callback for stdout specified: yaml
 ```
 
-**Cause:** `ansible-core` on Fedora 42 does not ship the `yaml` stdout
-callback. Only `ansible.builtin.*` callbacks are available without extra
-collections.
+`ansible-core` on Fedora 42 does not ship the `yaml` stdout callback.
 
-**Fix:** Use the built-in `default` callback in `ansible.cfg`:
+**Fix:** Use `ansible.builtin.default` in `ansible.cfg`:
 ```ini
 [defaults]
 stdout_callback   = ansible.builtin.default
-callbacks_enabled = ansible.posix.profile_tasks
 ```
 
 ---
 
-### [T2] `sudo: a password is required` during fact gathering
+### T2 — `sudo: a password is required` during fact gathering
 
-**Symptom:**
-```
-fatal: [kvm_host]: FAILED! => {"msg": "MODULE FAILURE ... sudo: a password is required"}
-```
-
-**Fix:** Add `become_ask_pass = True` to `ansible.cfg` or pass `-K`:
+**Fix:** Configure passwordless sudo or pass `-K`:
 ```bash
+echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$USER-nopasswd
+# or:
 ansible-playbook site.yml -K
 ```
 
 ---
 
-### [T3] DNS resolution broken after cleanup — `Could not resolve host`
+### T3 — DNS resolution broken — `Could not resolve host`
 
-**Symptom:** DNF fails with `Could not resolve hostname mirrors.fedoraproject.org`.
+**Symptom:** DNF or host DNS fails after cleanup.
 
-**Cause:** Stale configurations from a previous lab deployment:
-1. `/etc/systemd/resolved.conf` hardcoded to a dead DNS server
-2. A NetworkManager connection profile for a decommissioned bridge had a
-   stale `ipv4.dns` pointing to a non-existent gateway
+**Cause:** Stale NM connection profile with a dead `ipv4.dns` entry.
 
 **Fix:**
 ```bash
-# Reset systemd-resolved
-sudo tee /etc/systemd/resolved.conf <<'EOF'
-[Resolve]
-DNS=8.8.8.8 1.1.1.1
-FallbackDNS=8.8.4.4 9.9.9.9
-DNSStubListener=yes
-EOF
-
-# Remove stale NM connection profiles
-sudo nmcli connection show   # look for dead virbr/provisioning connections
-sudo nmcli connection delete <stale-connection>
-
-sudo systemctl restart systemd-resolved NetworkManager
+sudo nmcli connection show          # look for stale virbr/provisioning entries
+sudo nmcli connection delete <stale-name>
+sudo systemctl restart NetworkManager
 ```
 
 ---
 
-### [T4] `dnsmasq: failed to create listening socket — Address already in use`
+### T4 — `dnsmasq: Address already in use` on 192.168.200.1:53
 
-**Symptom:** `networks` role fails starting `labnet` with address conflict on `192.168.200.1:53`.
-
-**Cause 1 — Stale dnsmasq from old monolithic libvirtd:**
-```bash
-ls /var/run/libvirt/network/   # stale *.pid files
-```
-Fix:
+**Cause 1:** Stale PID files from old monolithic libvirtd:
 ```bash
 sudo kill $(cat /var/run/libvirt/network/*.pid 2>/dev/null) 2>/dev/null
 sudo rm -rf /var/run/libvirt/network/* /var/lib/libvirt/dnsmasq/virbr*.status
 ```
 
-**Cause 2 — BIND9 running and grabbing all ports:**
-```bash
-sudo ss -tulnp | grep ':53'   # named listening on 192.168.200.1:53
-```
-Fix: BIND9 should only bind after virbr4 exists (the network hook restarts it).
-If named started before virbr4, it grabbed `0.0.0.0:53`. Stop and restart:
+**Cause 2:** BIND9 started before `virbr4` and grabbed `0.0.0.0:53`:
 ```bash
 sudo systemctl restart named
 ```
 
 ---
 
-### [T5] `exec: "nmstatectl": executable file not found`
+### T5 — `exec: "nmstatectl": executable file not found`
 
-**Symptom:** `generate-ocp-config.yml` fails at ISO generation:
 ```
 failed to validate network yaml ... exec: "nmstatectl": executable file not found
 ```
 
-**Fix:** Install the `nmstate` package:
+**Fix:**
 ```bash
 sudo dnf install -y nmstate
 ansible-playbook generate-ocp-config.yml
 ```
 
-The `packages` role includes `nmstate` so a full `site.yml` run installs it.
-
 ---
 
-### [T6] `unknown field 'macAddress'` in NMState validation
-
-**Symptom:**
-```
-interfaces: unknown field `macAddress` at line 6 column 1
-```
+### T6 — `unknown field 'macAddress'` in NMState validation
 
 **Cause:** NMState 2.x requires `mac-address` (hyphenated) inside
-`networkConfig.interfaces`. The camelCase `macAddress` was only accepted by
-nmstate 1.x.
+`networkConfig.interfaces`. Note the distinction in `agent-config.yaml`:
+- `hosts[].interfaces[].macAddress` — OCP AgentConfig API field (camelCase, correct)
+- `hosts[].networkConfig.interfaces[].mac-address` — NMState 2.x field (hyphenated, correct)
 
-Note the distinction in `agent-config.yaml`:
-- `hosts[].interfaces[].macAddress` — OCP AgentConfig API field, stays camelCase
-- `hosts[].networkConfig.interfaces[].mac-address` — NMState 2.x field, use hyphen
-
-The template `ocp-config/agent-config.yaml.j2` uses the correct form.
+The template uses the correct form for both.
 
 ---
 
-### [T7] `installation-disk-speed-check` timeout (exit code 124)
+### T7 — `installation-disk-speed-check` timeout (exit 124)
 
-**Symptom:** All nodes stuck at `preparing-for-installation` with:
-```
-exit-code <124>   # timeout
-```
+**Symptom:** All nodes stuck at `preparing-for-installation`.
 
-**Cause:** OCP runs `fio --rw=write --ioengine=sync --fdatasync=1` to verify
-disk speed. With `cache='none'` (QEMU default), every guest `fdatasync` flushes
-to the physical disk. On a new qcow2, each write also triggers cluster
-allocation flushes. The combined overhead causes every fdatasync to take
-100–200ms, giving <10 IOPS — far below OCP's 10 MB/s minimum.
+**Cause:** OCP runs `fio --rw=write --ioengine=sync --fdatasync=1`. With
+`cache='none'` every `fdatasync` flushes to physical disk, giving <10 IOPS on
+a new qcow2.
 
-**Fix:** The VM XML template uses `cache='unsafe' io='threads'`:
-- Guest `fdatasync` becomes a no-op on the host
-- fio completes in seconds into the host page cache
-- Acceptable for a lab; do not use in production
+**Fix:** The VM template uses `cache='unsafe' io='threads'` — guest `fdatasync`
+becomes a no-op on the host. Acceptable for a lab.
 
 ---
 
-### [T8] DNS validation warning: `Error while evaluating DNS resolution on this host`
+### T8 — DNS validation warning on nodes
 
-**Symptom:** Nodes stuck at agent validation with persistent DNS warnings.
+**Symptom:** Nodes stuck at agent validation with DNS warnings.
 
-**What to check first:**
+**Check:**
 ```bash
-# From the host, verify api-int resolves
-dig api-int.ocp.lab.local @192.168.200.1 +short   # must return 192.168.200.10
+# Must return 192.168.200.10 immediately
+dig api-int.ocp.lab.local @192.168.200.1 +short
 
-# Verify AAAA queries return immediately (no timeout)
+# Must return in <2s (no timeout = no loop)
 timeout 2 dig api.ocp.lab.local AAAA @192.168.200.1 | grep status
 ```
 
-**Cause:** Either `api-int.ocp.lab.local` is missing from BIND, or the AAAA
-query is timing out (loop). In the current setup with BIND9, AAAA queries
-return `NOERROR` (empty) or `NXDOMAIN` immediately — no timeout.
-
-If `api-int` is missing, re-run the dns role:
+**Fix:** If `api-int` is missing:
 ```bash
 ansible-playbook site.yml --tags dns
 ```
 
 ---
 
-### [T9] Node booted back into installer after image write
+### T9 — Node booted back into installer after image write
 
 **Symptom:**
 ```
 Expected the host to boot from disk, but it booted the installation image
 ```
+Or node shows `installing-pending-user-action` in the assisted-service UI.
 
-**Fix:** Eject the ISO and reboot the specific node:
+**Why it happens:** The ISO is still boot order 2 in the UEFI. This should not
+occur with the current VM template (disk=1 in UEFI means the disk boots first
+once RHCOS writes its EFI bootloader to vda). If it does occur, verify the VM
+XML has the correct boot order:
+
 ```bash
-sudo virsh -c qemu:///system change-media ocp-control-1 sda --eject --live --config
-sudo virsh -c qemu:///system reboot ocp-control-1
+sudo virsh -c qemu:///system dumpxml ocp-control-1 | grep -A2 'boot order'
 ```
 
-To prevent this, always run `eject-iso.yml` in parallel with the install.
+The disk (`vda`) must have `<boot order='1'/>` and the cdrom (`sda`) must have
+`<boot order='2'/>`. If VMs were created before this fix, destroy and recreate:
+
+```bash
+ansible-playbook cleanup.yml -e "unattended=true"
+ansible-playbook deploy.yml
+```
 
 ---
 
-### [T10] Bootstrap-complete timeout — nodes never joined cluster
+### T10 — Bootstrap-complete timeout — nodes never joined cluster
 
-**Symptom:** `wait-for bootstrap-complete` times out. `oc get nodes` shows
-only 1 node. Nodes 2–5 have no SSH access (Permission denied).
-
-**Root cause:** If `api-int.ocp.lab.local` did not resolve at the moment
-a node's RHCOS first-boot ran ignition, that node never fetched its ignition
-config and booted without SSH keys, kubelet, or cluster membership. Fixing
-DNS on a live cluster does not recover these nodes — ignition runs once, in
-the initramfs, and does not retry.
+**Root cause:** `api-int.ocp.lab.local` did not resolve when a node's RHCOS
+first-boot ran ignition. The node booted without SSH keys or kubelet. DNS
+fixes do not help — ignition runs once in the initramfs and does not retry.
 
 **Recovery:** Full reinstall.
 ```bash
-ansible-playbook cleanup.yml
-ansible-playbook site.yml
-ansible-playbook generate-ocp-config.yml
-ansible-playbook site.yml --tags vms
-ansible-playbook eject-iso.yml
+ansible-playbook cleanup.yml -e "unattended=true"
+ansible-playbook deploy.yml
 ```
 
-**Prevention:** Always verify before starting VMs:
+**Prevention:** Verify before starting VMs:
 ```bash
 dig api-int.ocp.lab.local @192.168.200.1 +short   # MUST return 192.168.200.10
 ```
 
 ---
 
-### [T11] `openshift-apiserver` pod SIGSEGV (exit code 139) on a control node
+### T11 — `openshift-apiserver` pod SIGSEGV (exit 139)
 
-**Symptom:**
-```
-apiserver crashlooping container ... exit 139 (SIGSEGV)
-```
-
-**Cause:** Memory overcommit exhausted. The host has 62 GB RAM and 5 VMs
-allocated 64 GB total. When zram swap is full and the 32 GB swapfile on
-`/opt/swapfile` is not active (or not in fstab), the kernel cannot back
-anonymous mmaps. Go runtime mmaps fail, causing SIGSEGV inside any Go binary.
+**Cause:** Memory overcommit exhausted. 64 GB allocated on 62 GB host; swap
+not active.
 
 **Fix:**
 ```bash
-# Verify swap is active and correct
 swapon --show
 grep swapfile /etc/fstab
 
-# If swapfile is missing from fstab
+# If missing:
 echo '/opt/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab
 sudo swapon /opt/swapfile
 ```
-
-The `swap` role handles this automatically.
 
 ---
 
 ### T12 — Squashfs read errors on first RHCOS boot
 
-**Symptoms:** VM console shows a flood of kernel errors like:
+**Symptom:** VM console shows `SQUASHFS error: Unable to read page` and node
+reboots in a loop.
 
-```
-SQUASHFS error: Unable to read page, block …, size …
-SQUASHFS error: squashfs_read_data failed to read block …
-```
-
-The node may freeze at the boot splash or kernel-panic and reboot in a loop.
-
-**Cause:** Transient I/O contention. When 3–5 KVM VMs simultaneously pull container images during first-boot, RHCOS can fail to read the squashfs overlay from the *still-warming* QCOW2 disk. The RHCOS image write itself is complete and uncorrupted — this is a timing issue, not disk damage.
-
-**Diagnose without a TTY:**
-
-```bash
-sudo virsh screenshot ocp-worker-2 /tmp/worker2-screen.ppm
-# view /tmp/worker2-screen.ppm in an image viewer
-```
+**Cause:** Transient I/O contention when 3–5 VMs simultaneously boot. The RHCOS
+image write is complete — this is a timing issue, not disk damage.
 
 **Fix:**
-
 ```bash
-sudo virsh reset ocp-worker-2   # hard reset — equivalent to pressing the reset button
+sudo virsh reset ocp-worker-2
 ```
 
-On the next boot the disk I/O is no longer contested and RHCOS comes up cleanly. If errors persist after 2–3 resets, investigate the QCOW2 image itself (`qemu-img check`).
+The next boot has no I/O contention and RHCOS comes up cleanly. If errors
+persist after 2–3 resets:
+```bash
+sudo virsh screenshot ocp-worker-2 /tmp/screen.ppm   # view in an image viewer
+qemu-img check /opt/images/ocp-worker-2.qcow2
+```
 
 ---
 
 ### T13 — Worker stuck: `machine-config-daemon-pull` skipped, node never Ready
 
-**Symptoms:**
+**Symptom:** Node boots to login prompt but never appears Ready. `kubelet` and
+`crio` not running.
 
-- Node boots and reaches a login prompt, but `oc get nodes` never shows it as Ready
-- `kubelet` and `crio` are not running (or crash-loop immediately)
-- `systemctl status machine-config-daemon-pull` shows `Condition: start condition failed`
-
-**Root cause:** `machine-config-daemon-pull.service` has:
-
-```
-ConditionPathExists=/etc/ignition-machine-config-encapsulated.json
-```
-
-If the node crashed mid-way through its **first** Ignition run (e.g. due to squashfs errors — see T12), `/boot/ignition.firstboot` may have been removed (so Ignition won't re-run) but Ignition never wrote `/etc/ignition-machine-config-encapsulated.json`. MCD silently skips, kubelet never starts, the node looks like it booted but doesn't join.
-
-**Diagnose:**
-
-```bash
-ssh core@<node-ip>
-ls -la /etc/ignition-machine-config-encapsulated.json        # missing
-ls -la /etc/ignition-machine-config-encapsulated.json.bak    # present → safe to restore
-```
+**Cause:** Node crashed mid-ignition (e.g., squashfs error from T12). Ignition
+marked firstboot done but never wrote
+`/etc/ignition-machine-config-encapsulated.json`. MCD's `ConditionPathExists`
+check fails silently.
 
 **Fix:**
-
 ```bash
 ssh core@<node-ip>
 sudo cp /etc/ignition-machine-config-encapsulated.json.bak \
@@ -1059,44 +842,34 @@ sudo systemctl start machine-config-daemon-pull
 sudo systemctl start machine-config-daemon-firstboot
 ```
 
-MCD firstboot will pull the rendered MachineConfig, apply it, and then **reboot the node automatically** — this is normal. After the reboot the node joins the cluster and becomes Ready within a few minutes.
+The node will apply its MachineConfig and reboot automatically — this is normal.
+After the reboot it joins the cluster.
 
 ---
 
 ### T14 — `wait-for install-complete` times out: operators not Available
 
-**Symptoms:**
-
+**Symptom:**
 ```
 ERROR failed to initialize the cluster: Cluster operators authentication,
-console, ingress, monitoring are not available: timed out waiting for the condition
+console, ingress, monitoring are not available
 ```
 
-**Cause:** Several cluster operators require worker nodes to schedule their pods:
-
-| Operator | Why it needs workers |
-|---|---|
-| `ingress` | Deploys 2 `router-default` pods; needs ≥2 schedulable workers |
-| `monitoring` | `prometheus-operator-admission-webhook`, Prometheus, Alertmanager |
-| `console` | Console deployment needs a running ingress |
-| `authentication` | OAuth pods need running network stack |
-
-If any worker is missing (not Ready), these operators sit Degraded/Progressing indefinitely and the 40-minute `wait-for install-complete` timer expires before they recover.
+**Cause:** Operators that require workers (`ingress`, `monitoring`, `console`,
+`authentication`) are degraded if a worker is missing. The default 120-minute
+timeout may not be enough if workers join very late.
 
 **Diagnose:**
-
 ```bash
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
-
-oc get nodes                          # are all workers Ready?
-oc get co                             # which operators are not Available?
-oc get pods -n openshift-ingress      # ingress needs 2/2 router pods
-oc get pods -n openshift-monitoring   # prometheus/alertmanager scheduling?
-oc get csr | grep Pending             # any unnapproved node CSRs?
+oc get nodes
+oc get co
+oc get csr | grep Pending          # approve if any are waiting
+oc adm certificate approve $(oc get csr -o name | grep Pending)
 ```
 
-**Fix worker issues first** (see T12/T13), then re-run the monitor — there is no harm in running it multiple times:
-
+Fix worker issues (T12/T13) then restart the monitor (there is no harm running
+it multiple times):
 ```bash
 nohup /usr/local/bin/openshift-install --dir /opt/ocp/cluster \
     wait-for install-complete --log-level=info \
@@ -1108,18 +881,13 @@ tail -f /tmp/install-complete.log
 
 ### T15 — `openshift-install` monitor exits before install completes
 
-The `openshift-install wait-for bootstrap-complete` and `wait-for install-complete` processes are just **monitors** — they watch the cluster and exit 0 when done (or non-zero on timeout). If the terminal is closed or the process is killed mid-install the cluster is not affected; you just lose the watcher.
-
-**Re-attach or restart a monitor:**
+The `wait-for` commands are monitors only — killing them does not affect the
+cluster. Restart any time:
 
 ```bash
-# Check if a monitor is still running
 pgrep -a openshift-install
 
-# If multiple copies accumulated (harmless but messy):
-pkill -f 'wait-for bootstrap-complete'
-
-# Restart bootstrap-complete monitor (safe to run even after bootstrap)
+# Restart bootstrap-complete monitor
 nohup /usr/local/bin/openshift-install --dir /opt/ocp/cluster \
     wait-for bootstrap-complete --log-level=info \
     >> /tmp/bootstrap-complete.log 2>&1 &
@@ -1128,48 +896,104 @@ nohup /usr/local/bin/openshift-install --dir /opt/ocp/cluster \
 nohup /usr/local/bin/openshift-install --dir /opt/ocp/cluster \
     wait-for install-complete --log-level=info \
     >> /tmp/install-complete.log 2>&1 &
-
-tail -f /tmp/install-complete.log
 ```
 
-The install log at `/opt/ocp/cluster/.openshift_install.log` is the ground truth — the monitor simply reads events from the cluster, so restarting it always shows accurate current state regardless of how many times you've run it.
+Install log (ground truth): `/opt/ocp/cluster/.openshift_install.log`
 
 ---
 
-### Useful diagnostic commands
+### T16 — sushy-emulator: `libvirt driver not loaded`
+
+**Symptom:** `systemctl status sushy-emulator` shows `libvirt driver not loaded`.
+`curl http://192.168.200.1:8000/redfish/v1/Systems/` returns an error or empty list.
+
+**Cause:** The sushy venv was created without `--system-site-packages` and cannot
+see the system `python3-libvirt` package.
+
+**Fix:**
+```bash
+sudo systemctl stop sushy-emulator
+sudo rm -rf /opt/sushy-venv
+sudo python3 -m venv --system-site-packages /opt/sushy-venv
+sudo /opt/sushy-venv/bin/pip install sushy-tools
+sudo systemctl start sushy-emulator
+
+# Verify
+curl -s http://192.168.200.1:8000/redfish/v1/Systems/ | python3 -m json.tool
+```
+
+Or re-run the Ansible role:
+```bash
+ansible-playbook site.yml --tags sushy
+```
+
+---
+
+### T17 — Host goes to sleep during install (SSH disconnects)
+
+**Symptom:** SSH session drops repeatedly during long install. VMs keep running
+but openshift-install monitor (running in the foreground) is killed.
+
+**Cause:** GNOME default: `sleep-inactive-ac-timeout = 900` (15 min).
+
+**Fix:** See [System Sleep Prevention](#system-sleep-prevention) above.
+
+Quick check:
+```bash
+gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout
+# should be 0
+systemctl is-active suspend.target   # should be inactive (masked)
+```
+
+---
+
+### Diagnostic Commands
 
 ```bash
 # VM console (Ctrl+] to exit)
 virsh console ocp-control-1
 
-# Screenshot VM console to a PPM file (view with eog/display/feh)
-sudo virsh screenshot ocp-worker-2 /tmp/worker2-screen.ppm
+# Screenshot VM console
+sudo virsh screenshot ocp-worker-2 /tmp/screen.ppm
 
-# SSH into a node (core user, key from ~/.ssh/id_rsa)
+# SSH into a node
 ssh core@192.168.200.21
 
-# Clear stale host key after node reinstall
+# Clear stale host key after reinstall
 ssh-keygen -R 192.168.200.31
 
-# Watch agent bootstrap logs on the rendezvous node
+# Watch agent bootstrap logs on rendezvous node
 ssh core@192.168.200.21 journalctl -u agent.service -f
 
-# Install log (on the KVM host)
+# Install log on KVM host
 tail -f /opt/ocp/cluster/.openshift_install.log
 
-# Check all operator status
+# Cluster status
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
-oc get co
 oc get nodes
-oc get pods -A | grep -v Running | grep -v Completed
+oc get co
+oc get pods -A | grep -v -E 'Running|Completed'
 
-# Approve pending CSRs (node bootstrap / serving certs)
+# Approve pending CSRs
 oc get csr | grep Pending
 oc get csr -o name | xargs oc adm certificate approve
 
-# Watch etcd pods during bootstrap
-oc get pods -n openshift-etcd -w
+# sushy health
+curl -s http://192.168.200.1:8000/redfish/v1/Systems/ | python3 -m json.tool
+journalctl -u sushy-emulator -n 50
 
-# Watch kube-apiserver installer pods
-oc get pods -n openshift-kube-apiserver -w
+# BIND9
+dig api.ocp.lab.local @192.168.200.1 +short
+dig api-int.ocp.lab.local @192.168.200.1 +short
+sudo rndc status
+
+# HAProxy
+haproxy -c -f /etc/haproxy/haproxy.cfg
+echo "show stat" | sudo socat stdio /run/haproxy/admin.sock | cut -d',' -f1,2,18
+
+# VIP check
+ip addr show virbr4 | grep 192.168.200.1
+
+# VM list and state
+virsh -c qemu:///system list --all
 ```
