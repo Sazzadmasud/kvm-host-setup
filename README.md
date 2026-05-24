@@ -995,14 +995,161 @@ The `swap` role handles this automatically.
 
 ---
 
+### T12 — Squashfs read errors on first RHCOS boot
+
+**Symptoms:** VM console shows a flood of kernel errors like:
+
+```
+SQUASHFS error: Unable to read page, block …, size …
+SQUASHFS error: squashfs_read_data failed to read block …
+```
+
+The node may freeze at the boot splash or kernel-panic and reboot in a loop.
+
+**Cause:** Transient I/O contention. When 3–5 KVM VMs simultaneously pull container images during first-boot, RHCOS can fail to read the squashfs overlay from the *still-warming* QCOW2 disk. The RHCOS image write itself is complete and uncorrupted — this is a timing issue, not disk damage.
+
+**Diagnose without a TTY:**
+
+```bash
+sudo virsh screenshot ocp-worker-2 /tmp/worker2-screen.ppm
+# view /tmp/worker2-screen.ppm in an image viewer
+```
+
+**Fix:**
+
+```bash
+sudo virsh reset ocp-worker-2   # hard reset — equivalent to pressing the reset button
+```
+
+On the next boot the disk I/O is no longer contested and RHCOS comes up cleanly. If errors persist after 2–3 resets, investigate the QCOW2 image itself (`qemu-img check`).
+
+---
+
+### T13 — Worker stuck: `machine-config-daemon-pull` skipped, node never Ready
+
+**Symptoms:**
+
+- Node boots and reaches a login prompt, but `oc get nodes` never shows it as Ready
+- `kubelet` and `crio` are not running (or crash-loop immediately)
+- `systemctl status machine-config-daemon-pull` shows `Condition: start condition failed`
+
+**Root cause:** `machine-config-daemon-pull.service` has:
+
+```
+ConditionPathExists=/etc/ignition-machine-config-encapsulated.json
+```
+
+If the node crashed mid-way through its **first** Ignition run (e.g. due to squashfs errors — see T12), `/boot/ignition.firstboot` may have been removed (so Ignition won't re-run) but Ignition never wrote `/etc/ignition-machine-config-encapsulated.json`. MCD silently skips, kubelet never starts, the node looks like it booted but doesn't join.
+
+**Diagnose:**
+
+```bash
+ssh core@<node-ip>
+ls -la /etc/ignition-machine-config-encapsulated.json        # missing
+ls -la /etc/ignition-machine-config-encapsulated.json.bak    # present → safe to restore
+```
+
+**Fix:**
+
+```bash
+ssh core@<node-ip>
+sudo cp /etc/ignition-machine-config-encapsulated.json.bak \
+        /etc/ignition-machine-config-encapsulated.json
+sudo systemctl start machine-config-daemon-pull
+sudo systemctl start machine-config-daemon-firstboot
+```
+
+MCD firstboot will pull the rendered MachineConfig, apply it, and then **reboot the node automatically** — this is normal. After the reboot the node joins the cluster and becomes Ready within a few minutes.
+
+---
+
+### T14 — `wait-for install-complete` times out: operators not Available
+
+**Symptoms:**
+
+```
+ERROR failed to initialize the cluster: Cluster operators authentication,
+console, ingress, monitoring are not available: timed out waiting for the condition
+```
+
+**Cause:** Several cluster operators require worker nodes to schedule their pods:
+
+| Operator | Why it needs workers |
+|---|---|
+| `ingress` | Deploys 2 `router-default` pods; needs ≥2 schedulable workers |
+| `monitoring` | `prometheus-operator-admission-webhook`, Prometheus, Alertmanager |
+| `console` | Console deployment needs a running ingress |
+| `authentication` | OAuth pods need running network stack |
+
+If any worker is missing (not Ready), these operators sit Degraded/Progressing indefinitely and the 40-minute `wait-for install-complete` timer expires before they recover.
+
+**Diagnose:**
+
+```bash
+export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
+
+oc get nodes                          # are all workers Ready?
+oc get co                             # which operators are not Available?
+oc get pods -n openshift-ingress      # ingress needs 2/2 router pods
+oc get pods -n openshift-monitoring   # prometheus/alertmanager scheduling?
+oc get csr | grep Pending             # any unnapproved node CSRs?
+```
+
+**Fix worker issues first** (see T12/T13), then re-run the monitor — there is no harm in running it multiple times:
+
+```bash
+nohup /usr/local/bin/openshift-install --dir /opt/ocp/cluster \
+    wait-for install-complete --log-level=info \
+    >> /tmp/install-complete.log 2>&1 &
+tail -f /tmp/install-complete.log
+```
+
+---
+
+### T15 — `openshift-install` monitor exits before install completes
+
+The `openshift-install wait-for bootstrap-complete` and `wait-for install-complete` processes are just **monitors** — they watch the cluster and exit 0 when done (or non-zero on timeout). If the terminal is closed or the process is killed mid-install the cluster is not affected; you just lose the watcher.
+
+**Re-attach or restart a monitor:**
+
+```bash
+# Check if a monitor is still running
+pgrep -a openshift-install
+
+# If multiple copies accumulated (harmless but messy):
+pkill -f 'wait-for bootstrap-complete'
+
+# Restart bootstrap-complete monitor (safe to run even after bootstrap)
+nohup /usr/local/bin/openshift-install --dir /opt/ocp/cluster \
+    wait-for bootstrap-complete --log-level=info \
+    >> /tmp/bootstrap-complete.log 2>&1 &
+
+# Restart install-complete monitor
+nohup /usr/local/bin/openshift-install --dir /opt/ocp/cluster \
+    wait-for install-complete --log-level=info \
+    >> /tmp/install-complete.log 2>&1 &
+
+tail -f /tmp/install-complete.log
+```
+
+The install log at `/opt/ocp/cluster/.openshift_install.log` is the ground truth — the monitor simply reads events from the cluster, so restarting it always shows accurate current state regardless of how many times you've run it.
+
+---
+
 ### Useful diagnostic commands
 
 ```bash
 # VM console (Ctrl+] to exit)
 virsh console ocp-control-1
 
+# Screenshot VM console to a PPM file (view with eog/display/feh)
+sudo virsh screenshot ocp-worker-2 /tmp/worker2-screen.ppm
+
 # SSH into a node (core user, key from ~/.ssh/id_rsa)
 ssh core@192.168.200.21
+
+# Clear stale host key after node reinstall
+ssh-keygen -R 192.168.200.31
 
 # Watch agent bootstrap logs on the rendezvous node
 ssh core@192.168.200.21 journalctl -u agent.service -f
@@ -1015,4 +1162,14 @@ export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
 oc get co
 oc get nodes
 oc get pods -A | grep -v Running | grep -v Completed
+
+# Approve pending CSRs (node bootstrap / serving certs)
+oc get csr | grep Pending
+oc get csr -o name | xargs oc adm certificate approve
+
+# Watch etcd pods during bootstrap
+oc get pods -n openshift-etcd -w
+
+# Watch kube-apiserver installer pods
+oc get pods -n openshift-kube-apiserver -w
 ```
