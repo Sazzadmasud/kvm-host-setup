@@ -1,0 +1,6 @@
+<network>
+  <name>{{ osp_internalapi_network_name }}</name>
+  <bridge name='{{ osp_internalapi_bridge }}' stp='on' delay='0'/>
+  <!-- Isolated L2 only: no NAT, no DHCP, no host IP.
+       OpenStack nodes configure addresses via NNCP (NMState). -->
+</network>

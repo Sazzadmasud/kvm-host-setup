@@ -1,0 +1,13 @@
+[Interface]
+Address = {{ wireguard_server_ip }}/24
+ListenPort = {{ wireguard_port }}
+PrivateKey = {{ wg_server_privkey.content | b64decode | trim }}
+
+# Forward WireGuard client traffic to the VM networks, masquerading as the host.
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s {{ wireguard_subnet }} -o {{ ocp_network_bridge }} -j MASQUERADE; iptables -t nat -A POSTROUTING -s {{ wireguard_subnet }} -o {{ osp_provider_bridge }} -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s {{ wireguard_subnet }} -o {{ ocp_network_bridge }} -j MASQUERADE; iptables -t nat -D POSTROUTING -s {{ wireguard_subnet }} -o {{ osp_provider_bridge }} -j MASQUERADE
+
+[Peer]
+# Mac client
+PublicKey = {{ wg_client_pubkey.content | b64decode | trim }}
+AllowedIPs = {{ wireguard_client_ip }}/32

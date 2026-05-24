@@ -1,0 +1,13 @@
+<network>
+  <name>{{ osp_provider_network_name }}</name>
+  <forward mode='nat'>
+    <nat>
+      <port start='1024' end='65535'/>
+    </nat>
+  </forward>
+  <bridge name='{{ osp_provider_bridge }}' stp='on' delay='0'/>
+  <!-- DNS disabled; no DHCP — OpenStack Neutron manages IPs on this network.
+       Host IP ({{ osp_provider_gateway }}) is the default gateway for floating IPs. -->
+  <dns enable='no'/>
+  <ip address='{{ osp_provider_gateway }}' netmask='{{ osp_provider_netmask }}'/>
+</network>

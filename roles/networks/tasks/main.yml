@@ -1,5 +1,10 @@
 ---
 # ──────────────────────────────────────────────
+#  Helper macro — define + autostart + start a
+#  libvirt network from a rendered XML file
+# ──────────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 #  Define the OCP lab network
 # ──────────────────────────────────────────────
 - name: Render labnet XML
@@ -75,3 +80,60 @@
     regexp: "{{ item.name }}\\.{{ cluster_name }}\\.{{ base_domain }}"
     line: "{{ item.ip }} {{ item.name }}.{{ cluster_name }}.{{ base_domain }}"
   loop: "{{ control_nodes + worker_nodes }}"
+
+# ──────────────────────────────────────────────
+#  RHOSO networks
+# ──────────────────────────────────────────────
+- name: Render osp-internalapi XML
+  ansible.builtin.template:
+    src: osp-internalapi.xml.j2
+    dest: /tmp/osp-internalapi.xml
+    mode: "0644"
+
+- name: Check if osp-internalapi is already defined
+  ansible.builtin.command: "virsh -c qemu:///system net-info {{ osp_internalapi_network_name }}"
+  register: internalapi_net_info
+  changed_when: false
+  ignore_errors: true
+
+- name: Define osp-internalapi
+  ansible.builtin.command: "virsh -c qemu:///system net-define /tmp/osp-internalapi.xml"
+  when: internalapi_net_info.rc != 0
+  changed_when: true
+
+- name: Autostart osp-internalapi
+  ansible.builtin.command: "virsh -c qemu:///system net-autostart {{ osp_internalapi_network_name }}"
+  changed_when: true
+
+- name: Start osp-internalapi
+  ansible.builtin.command: "virsh -c qemu:///system net-start {{ osp_internalapi_network_name }}"
+  register: internalapi_start
+  changed_when: internalapi_start.rc == 0
+  failed_when: internalapi_start.rc != 0 and 'already active' not in internalapi_start.stderr
+
+- name: Render osp-provider XML
+  ansible.builtin.template:
+    src: osp-provider.xml.j2
+    dest: /tmp/osp-provider.xml
+    mode: "0644"
+
+- name: Check if osp-provider is already defined
+  ansible.builtin.command: "virsh -c qemu:///system net-info {{ osp_provider_network_name }}"
+  register: provider_net_info
+  changed_when: false
+  ignore_errors: true
+
+- name: Define osp-provider
+  ansible.builtin.command: "virsh -c qemu:///system net-define /tmp/osp-provider.xml"
+  when: provider_net_info.rc != 0
+  changed_when: true
+
+- name: Autostart osp-provider
+  ansible.builtin.command: "virsh -c qemu:///system net-autostart {{ osp_provider_network_name }}"
+  changed_when: true
+
+- name: Start osp-provider
+  ansible.builtin.command: "virsh -c qemu:///system net-start {{ osp_provider_network_name }}"
+  register: provider_start
+  changed_when: provider_start.rc == 0
+  failed_when: provider_start.rc != 0 and 'already active' not in provider_start.stderr

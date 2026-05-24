@@ -1,0 +1,14 @@
+[Interface]
+Address = {{ wireguard_client_ip }}/24
+PrivateKey = {{ wg_client_privkey.content | b64decode | trim }}
+# BIND9 on the KVM host resolves *.ocp.lab.local — routed through the tunnel.
+DNS = {{ ocp_network_gateway }}
+
+[Peer]
+# KVM lab host
+PublicKey = {{ wg_server_pubkey.content | b64decode | trim }}
+Endpoint = {{ wireguard_server_endpoint }}:{{ wireguard_port }}
+# OCP cluster + floating IP network routed through tunnel.
+# Add 172.17.0.0/24 here if you need direct access to RHOSO InternalAPI.
+AllowedIPs = {{ wireguard_subnet }}, {{ ocp_network_cidr }}, {{ osp_provider_cidr }}
+PersistentKeepalive = 25

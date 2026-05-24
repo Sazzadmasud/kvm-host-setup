@@ -54,24 +54,34 @@ control_nodes:
     mac: "52:54:00:c0:01:01"
     ip: 192.168.200.21
     role: master
+    mac_internalapi: "52:54:00:c0:03:01"
+    mac_provider: "52:54:00:c0:04:01"
   - name: ocp-control-2
     mac: "52:54:00:c0:01:02"
     ip: 192.168.200.22
     role: master
+    mac_internalapi: "52:54:00:c0:03:02"
+    mac_provider: "52:54:00:c0:04:02"
   - name: ocp-control-3
     mac: "52:54:00:c0:01:03"
     ip: 192.168.200.23
     role: master
+    mac_internalapi: "52:54:00:c0:03:03"
+    mac_provider: "52:54:00:c0:04:03"
 
 worker_nodes:
   - name: ocp-worker-1
     mac: "52:54:00:c0:02:01"
     ip: 192.168.200.31
     role: worker
+    mac_internalapi: "52:54:00:c0:03:04"
+    mac_provider: "52:54:00:c0:04:04"
   - name: ocp-worker-2
     mac: "52:54:00:c0:02:02"
     ip: 192.168.200.32
     role: worker
+    mac_internalapi: "52:54:00:c0:03:05"
+    mac_provider: "52:54:00:c0:04:05"
 
 # ──────────────────────────────────────────────
 #  Directories to wipe during full cleanup
@@ -91,3 +101,30 @@ libvirt_user: "{{ ansible_user_id }}"
 sushy_port: 8000
 # Accessible from VMs via the bridge gateway
 sushy_host: "{{ ocp_network_gateway }}"
+
+# ──────────────────────────────────────────────
+#  RHOSO — extra VM networks
+# ──────────────────────────────────────────────
+osp_internalapi_network_name: osp-internalapi
+osp_internalapi_bridge: virbr5
+# Isolated L2 only — nodes configure IPs via NNCP (NMState/NodeNetworkConfigurationPolicy)
+
+osp_provider_network_name: osp-provider
+osp_provider_bridge: virbr6
+osp_provider_gateway: 10.0.100.1
+osp_provider_cidr: 10.0.100.0/24
+osp_provider_netmask: 255.255.255.0
+# NAT'd — floating IP range: 10.0.100.100–200 (configured in RHOSO later)
+
+# ──────────────────────────────────────────────
+#  WireGuard VPN
+# ──────────────────────────────────────────────
+wireguard_port: 51820
+wireguard_server_ip: 10.10.0.1      # KVM host WG address
+wireguard_client_ip: 10.10.0.2      # Mac client WG address
+wireguard_subnet: 10.10.0.0/24
+
+# Set to your router's public IP if connecting from outside the LAN.
+# For LAN-only access, the host's local IP (192.168.1.154) is fine.
+# For internet access: set your router's public IP and forward UDP 51820 → 192.168.1.154.
+wireguard_server_endpoint: "192.168.1.154"

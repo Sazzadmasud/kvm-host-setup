@@ -51,12 +51,30 @@
       <boot order='2'/>
     </disk>
 
-    <!-- NIC on OCP lab network -->
+    <!-- NIC 1: OCP lab network (labnet) -->
     <interface type='network'>
       <mac address='{{ vm.mac }}'/>
       <source network='{{ ocp_network_name }}'/>
       <model type='virtio'/>
     </interface>
+
+    <!-- NIC 2: RHOSO InternalAPI (isolated L2, nodes configure IPs via NNCP) -->
+    {% if vm.mac_internalapi is defined %}
+    <interface type='network'>
+      <mac address='{{ vm.mac_internalapi }}'/>
+      <source network='{{ osp_internalapi_network_name }}'/>
+      <model type='virtio'/>
+    </interface>
+    {% endif %}
+
+    <!-- NIC 3: RHOSO Provider/External (NAT, floating IP egress) -->
+    {% if vm.mac_provider is defined %}
+    <interface type='network'>
+      <mac address='{{ vm.mac_provider }}'/>
+      <source network='{{ osp_provider_network_name }}'/>
+      <model type='virtio'/>
+    </interface>
+    {% endif %}
 
     <!-- Serial console (for debugging) -->
     <serial type='pty'>

@@ -1,0 +1,97 @@
+---
+- name: Install wireguard-tools
+  ansible.builtin.dnf:
+    name: wireguard-tools
+    state: present
+
+- name: Create /etc/wireguard directory
+  ansible.builtin.file:
+    path: /etc/wireguard
+    state: directory
+    mode: "0700"
+    owner: root
+    group: root
+
+- name: Generate server key pair (idempotent)
+  ansible.builtin.shell: |
+    wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
+    chmod 600 /etc/wireguard/server.key
+  args:
+    creates: /etc/wireguard/server.key
+
+- name: Generate client key pair (idempotent)
+  ansible.builtin.shell: |
+    wg genkey | tee /etc/wireguard/client.key | wg pubkey > /etc/wireguard/client.pub
+    chmod 600 /etc/wireguard/client.key
+  args:
+    creates: /etc/wireguard/client.key
+
+- name: Read server private key
+  ansible.builtin.slurp:
+    src: /etc/wireguard/server.key
+  register: wg_server_privkey
+  no_log: true
+
+- name: Read server public key
+  ansible.builtin.slurp:
+    src: /etc/wireguard/server.pub
+  register: wg_server_pubkey
+
+- name: Read client private key
+  ansible.builtin.slurp:
+    src: /etc/wireguard/client.key
+  register: wg_client_privkey
+  no_log: true
+
+- name: Read client public key
+  ansible.builtin.slurp:
+    src: /etc/wireguard/client.pub
+  register: wg_client_pubkey
+
+- name: Deploy wg0.conf (server)
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: /etc/wireguard/wg0.conf
+    mode: "0600"
+    owner: root
+    group: root
+  notify: Restart wg-quick@wg0
+
+- name: Deploy client config
+  ansible.builtin.template:
+    src: wg-client.conf.j2
+    dest: /etc/wireguard/client.conf
+    mode: "0600"
+    owner: root
+    group: root
+
+- name: Enable IP forwarding
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+
+- name: Open WireGuard port in firewalld (public zone)
+  ansible.posix.firewalld:
+    zone: public
+    port: "{{ wireguard_port }}/udp"
+    permanent: true
+    state: enabled
+    immediate: true
+
+- name: Enable and start WireGuard
+  ansible.builtin.systemd:
+    name: "wg-quick@wg0"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Print client config instructions
+  ansible.builtin.debug:
+    msg:
+      - "WireGuard is up. Server: {{ wireguard_server_endpoint }}:{{ wireguard_port }}"
+      - "Copy client config to your Mac:"
+      - "  scp {{ ansible_host | default('localhost') }}:/etc/wireguard/client.conf ~/wg-ocp-lab.conf"
+      - "Then: import ~/wg-ocp-lab.conf into the WireGuard app on macOS."

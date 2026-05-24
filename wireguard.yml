@@ -1,0 +1,20 @@
+---
+# Install and configure WireGuard VPN on the KVM host.
+# Run once — idempotent (key generation skipped if keys already exist).
+#
+# After running, copy the client config to your Mac:
+#   scp <kvm-host>:/etc/wireguard/client.conf ~/wg-ocp-lab.conf
+# Then import ~/wg-ocp-lab.conf into the WireGuard app on macOS.
+#
+# For internet access (outside LAN), set wireguard_server_endpoint to your
+# router's public IP and forward UDP {{ wireguard_port }} → 192.168.1.154.
+#
+# Usage:
+#   ansible-playbook wireguard.yml
+
+- name: Configure WireGuard VPN
+  hosts: kvm_hosts
+  gather_facts: true
+
+  roles:
+    - role: wireguard

@@ -1,0 +1,144 @@
+---
+# Attach RHOSO extra NICs to running VMs.
+# Run this once after the OCP cluster is installed — adds the InternalAPI
+# and Provider interfaces to all nodes without rebooting them.
+#
+# Usage:
+#   ansible-playbook attach-osp-nics.yml
+#
+# Idempotent: skips attach if the MAC is already present in the VM config.
+
+- name: Define RHOSO libvirt networks
+  hosts: kvm_hosts
+  gather_facts: false
+
+  tasks:
+    - name: Render osp-internalapi XML
+      ansible.builtin.template:
+        src: roles/networks/templates/osp-internalapi.xml.j2
+        dest: /tmp/osp-internalapi.xml
+        mode: "0644"
+
+    - name: Define osp-internalapi (if not present)
+      ansible.builtin.command: "virsh -c qemu:///system net-define /tmp/osp-internalapi.xml"
+      register: define_internalapi
+      changed_when: define_internalapi.rc == 0
+      failed_when: define_internalapi.rc != 0 and 'already exists' not in define_internalapi.stderr
+
+    - name: Autostart + start osp-internalapi
+      ansible.builtin.shell: |
+        virsh -c qemu:///system net-autostart {{ osp_internalapi_network_name }}
+        virsh -c qemu:///system net-start {{ osp_internalapi_network_name }} 2>/dev/null || true
+      changed_when: true
+
+    - name: Render osp-provider XML
+      ansible.builtin.template:
+        src: roles/networks/templates/osp-provider.xml.j2
+        dest: /tmp/osp-provider.xml
+        mode: "0644"
+
+    - name: Define osp-provider (if not present)
+      ansible.builtin.command: "virsh -c qemu:///system net-define /tmp/osp-provider.xml"
+      register: define_provider
+      changed_when: define_provider.rc == 0
+      failed_when: define_provider.rc != 0 and 'already exists' not in define_provider.stderr
+
+    - name: Autostart + start osp-provider
+      ansible.builtin.shell: |
+        virsh -c qemu:///system net-autostart {{ osp_provider_network_name }}
+        virsh -c qemu:///system net-start {{ osp_provider_network_name }} 2>/dev/null || true
+      changed_when: true
+
+- name: Hot-attach extra NICs to all OCP VMs
+  hosts: kvm_hosts
+  gather_facts: false
+
+  tasks:
+    - name: Attach InternalAPI NIC (live + persistent)
+      ansible.builtin.shell: |
+        # Skip if MAC already in VM config
+        if virsh -c qemu:///system dumpxml {{ item.name }} | grep -q '{{ item.mac_internalapi }}'; then
+          echo "already attached"
+          exit 0
+        fi
+        virsh -c qemu:///system attach-interface {{ item.name }} \
+          network {{ osp_internalapi_network_name }} \
+          --mac {{ item.mac_internalapi }} \
+          --model virtio \
+          --config --live
+      loop: "{{ control_nodes + worker_nodes }}"
+      register: attach_internalapi
+      changed_when: "'already attached' not in attach_internalapi.stdout"
+
+    - name: Attach Provider NIC (persistent config only — requires VM restart)
+      ansible.builtin.shell: |
+        if virsh -c qemu:///system dumpxml {{ item.name }} | grep -q '{{ item.mac_provider }}'; then
+          echo "already attached"
+          exit 0
+        fi
+        virsh -c qemu:///system attach-interface {{ item.name }} \
+          network {{ osp_provider_network_name }} \
+          --mac {{ item.mac_provider }} \
+          --model virtio \
+          --config
+      loop: "{{ control_nodes + worker_nodes }}"
+      register: attach_provider
+      changed_when: "'already attached' not in attach_provider.stdout"
+
+    # Cold restart (destroy + start) reloads the QEMU process with the updated
+    # persistent XML. Required because pcie-root-port slots are assigned at QEMU
+    # startup; a live hotplug of a 3rd NIC fails with "No more available PCI slots"
+    # if no spare root ports were pre-allocated.
+    - name: Cold restart control nodes one at a time (destroy + start)
+      ansible.builtin.shell: |
+        echo "Stopping {{ item.name }}..."
+        virsh -c qemu:///system destroy {{ item.name }} 2>/dev/null || true
+        for i in $(seq 1 20); do
+          if ! virsh -c qemu:///system list | grep -q '{{ item.name }}'; then break; fi
+          sleep 2
+        done
+        echo "Starting {{ item.name }}..."
+        virsh -c qemu:///system start {{ item.name }}
+        for i in $(seq 1 60); do
+          if virsh -c qemu:///system list | grep -q '{{ item.name }}.*running'; then
+            sleep 30
+            break
+          fi
+          sleep 5
+        done
+        echo "{{ item.name }} is up"
+      loop: "{{ control_nodes }}"
+      register: ctrl_restart
+
+    - name: Cold restart worker nodes one at a time (destroy + start)
+      ansible.builtin.shell: |
+        echo "Stopping {{ item.name }}..."
+        virsh -c qemu:///system destroy {{ item.name }} 2>/dev/null || true
+        for i in $(seq 1 20); do
+          if ! virsh -c qemu:///system list | grep -q '{{ item.name }}'; then break; fi
+          sleep 2
+        done
+        echo "Starting {{ item.name }}..."
+        virsh -c qemu:///system start {{ item.name }}
+        for i in $(seq 1 40); do
+          if virsh -c qemu:///system list | grep -q '{{ item.name }}.*running'; then
+            sleep 20
+            break
+          fi
+          sleep 5
+        done
+        echo "{{ item.name }} is up"
+      loop: "{{ worker_nodes }}"
+      register: wkr_restart
+
+    - name: Verify all NICs present in persistent config
+      ansible.builtin.shell: |
+        virsh -c qemu:///system domiflist {{ item.name }}
+      loop: "{{ control_nodes + worker_nodes }}"
+      register: iflist
+      changed_when: false
+
+    - name: Show NIC list per VM
+      ansible.builtin.debug:
+        msg: "{{ item.item.name }}: {{ item.stdout_lines }}"
+      loop: "{{ iflist.results }}"

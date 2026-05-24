@@ -297,6 +297,33 @@ when writing the node's `resolv.conf`.
 
 ---
 
+### RHOSO Networks
+
+**Role:** `networks` (added to main network setup)
+
+Two additional libvirt bridges are created for RHOSO (Red Hat OpenStack Services on OpenShift):
+
+| Network | Bridge | Subnet | Mode | Purpose |
+|---|---|---|---|---|
+| `osp-internalapi` | `virbr5` | isolated L2 | isolated | OpenStack internal API traffic between services |
+| `osp-provider` | `virbr6` | 10.0.100.0/24 | NAT | OpenStack external network / floating IP egress |
+
+**osp-internalapi** is a pure L2 isolated bridge with no host IP and no DHCP. RHOSO configures node IP addresses on this interface via NMState `NodeNetworkConfigurationPolicy` (NNCP). No routing to or from outside.
+
+**osp-provider** is a NAT bridge with host IP `10.0.100.1/24`. OpenStack's external network maps to this bridge. Floating IPs are allocated from `10.0.100.100–200` (configured in RHOSO). The host masquerades traffic for internet egress.
+
+Each OCP node has all 3 NICs defined in the VM XML from creation time:
+
+| NIC | Network | MAC prefix |
+|---|---|---|
+| eth0 / NIC 1 | `labnet` (OCP) | `52:54:00:c0:01:xx` / `52:54:00:c0:02:xx` |
+| NIC 2 | `osp-internalapi` | `52:54:00:c0:03:xx` |
+| NIC 3 | `osp-provider` | `52:54:00:c0:04:xx` |
+
+**Note on PCIe slots:** Q35 VMs allocate PCIe root ports at QEMU startup. All 3 NICs must be defined in the VM XML at creation time — live hotplug of a 3rd NIC fails with "No more available PCI slots". `deploy.yml` handles this correctly. The `attach-osp-nics.yml` playbook handles migration of existing clusters (adds NICs to persistent XML, then cold-restarts VMs).
+
+---
+
 ### Redfish Emulator — sushy
 
 **Role:** `sushy`
@@ -340,6 +367,39 @@ Verify sushy is working:
 ```bash
 curl -s http://192.168.200.1:8000/redfish/v1/Systems/ | python3 -m json.tool
 ```
+
+---
+
+### WireGuard VPN
+
+**Playbook:** `wireguard.yml` (standalone — not part of `site.yml`)
+
+WireGuard gives remote access to the KVM host and all VM networks from a Mac.
+
+| Host | WireGuard IP | Routes via tunnel |
+|---|---|---|
+| KVM host | 10.10.0.1 | — |
+| Mac client | 10.10.0.2 | 192.168.200.0/24, 10.0.100.0/24 |
+
+**Setup:**
+
+```bash
+# 1. Run the playbook (generates keys, deploys config, starts wg-quick@wg0)
+ansible-playbook wireguard.yml
+
+# 2. Copy client config to Mac
+scp <kvm-host>:/etc/wireguard/client.conf ~/wg-ocp-lab.conf
+
+# 3. Import into WireGuard app on macOS (File → Import Tunnel)
+```
+
+Install the [WireGuard macOS app](https://apps.apple.com/us/app/wireguard/id1451685025) from the App Store.
+
+**For internet (outside LAN) access:** Set `wireguard_server_endpoint` in [group_vars/all.yml](group_vars/all.yml) to your router's public IP and forward UDP port 51820 → `192.168.1.154` on your router.
+
+**Re-running** `wireguard.yml` is safe and idempotent — keys are only generated once (`creates:` guard). To force new keys, delete `/etc/wireguard/server.key` and `/etc/wireguard/client.key` on the host first, then re-run.
+
+**DNS over VPN:** The client config sets DNS to `192.168.200.1` (BIND9), so `*.ocp.lab.local` resolves correctly when the tunnel is active.
 
 ---
 
@@ -603,10 +663,15 @@ kvm-host-setup/
 │   │   ├── handlers/main.yml            # Reload systemd, restart sushy-emulator
 │   │   ├── templates/sushy.conf.j2      # Redfish emulator config
 │   │   └── templates/sushy-emulator.service.j2
+│   ├── wireguard/
+│   │   ├── tasks/main.yml               # Install, generate keys, deploy config
+│   │   ├── handlers/main.yml            # Restart wg-quick@wg0
+│   │   ├── templates/wg0.conf.j2        # Server config (PostUp/PostDown iptables)
+│   │   └── templates/wg-client.conf.j2  # Client config for macOS
 │   ├── storage_pool/tasks/main.yml      # /opt/images pool in libvirt
 │   └── vms/
 │       ├── tasks/main.yml               # Disk images + VM XML + start
-│       └── templates/vm.xml.j2          # VM: q35, UEFI, disk=1/ISO=2, cache=unsafe
+│       └── templates/vm.xml.j2          # VM: q35, UEFI, 3 NICs, disk=1/ISO=2
 │
 ├── ocp-config/
 │   ├── install-config.yaml.j2           # Cluster config (network, replicas)
@@ -616,7 +681,9 @@ kvm-host-setup/
 ├── deploy.yml                           # Unattended end-to-end deploy
 ├── cleanup.yml                          # Wipe VMs, networks, install dirs
 ├── generate-ocp-config.yml              # Render configs + openshift-install create image
-└── eject-iso.yml                        # Wait for bootstrap-complete + install-complete
+├── eject-iso.yml                        # Wait for bootstrap-complete + install-complete
+├── wireguard.yml                        # Install/configure WireGuard VPN (standalone)
+└── attach-osp-nics.yml                  # Add RHOSO NICs to existing cluster (migration)
 ```
 
 ---
