@@ -78,7 +78,7 @@ worker_nodes:
 # ──────────────────────────────────────────────
 cleanup_dirs:
   - /opt/images
-  - /opt/ocp
+  - /opt/ocp/cluster   # install state only — pull-secret.json at /opt/ocp/ is preserved
   - /opt/ocp-build
   - /opt/ocp-lab
 
