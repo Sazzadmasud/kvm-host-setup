@@ -14,10 +14,15 @@
   gather_facts: true
 
   vars:
-    bootstrap_timeout_minutes: 90   # max wait for bootstrap-complete
-    install_timeout_minutes: 120    # max wait for install-complete (cluster operators need ~90m)
+    bootstrap_timeout_minutes: 90    # max wait for bootstrap-complete
+    install_timeout_minutes: 180     # max wait for install-complete
+                                     # operators need ~90-150m on this hardware;
+                                     # late-joining workers push convergence past 120m
 
   tasks:
+    # ──────────────────────────────────────────────
+    #  Phase 1 — bootstrap-complete
+    # ──────────────────────────────────────────────
     - name: Start openshift-install agent wait-for bootstrap-complete (background)
       ansible.builtin.command: >
         /usr/local/bin/openshift-install agent wait-for bootstrap-complete
@@ -47,6 +52,8 @@
 
     # ──────────────────────────────────────────────
     #  Phase 2 — wait for install-complete
+    #  ignore_errors so post-install fixups always
+    #  run even if the monitor times out
     # ──────────────────────────────────────────────
     - name: Start wait-for install-complete (background)
       ansible.builtin.command: >
@@ -63,20 +70,11 @@
       until: ic_result.finished
       retries: "{{ install_timeout_minutes * 2 }}"
       delay: 30
-
-    - name: Install-complete outcome
-      ansible.builtin.debug:
-        msg: >-
-          Install {{ 'completed successfully' if (ic_result.rc | default(1)) == 0
-                     else 'FAILED (rc=' + ((ic_result.rc | default('?')) | string) + ')' }}
-
-    - name: Fail play if install did not complete
-      ansible.builtin.fail:
-        msg: "Install-complete returned rc={{ ic_result.rc }}"
-      when: (ic_result.rc | default(1)) != 0
+      ignore_errors: true   # allow post-install fixups to run on timeout
 
     # ──────────────────────────────────────────────
-    #  Post-install fixups
+    #  Post-install fixups — run regardless of
+    #  whether install-complete succeeded or timed out
     # ──────────────────────────────────────────────
     - name: Fix ownership of OCP install directory
       ansible.builtin.file:
@@ -94,6 +92,9 @@
         state: present
       become: false
 
+    # ──────────────────────────────────────────────
+    #  Report outcome
+    # ──────────────────────────────────────────────
     - name: Installation complete
       ansible.builtin.debug:
         msg:
@@ -102,3 +103,27 @@
           - "Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ base_domain }}"
           - "kubeadmin password: cat {{ ocp_install_dir }}/auth/kubeadmin-password"
           - "KUBECONFIG added to ~/.bashrc — run: source ~/.bashrc"
+      when: (ic_result.rc | default(1)) == 0
+
+    - name: Install-complete timed out — cluster may still be converging
+      ansible.builtin.debug:
+        msg:
+          - "install-complete did not finish within {{ install_timeout_minutes }} minutes."
+          - "This is normal on slower hardware — operators continue converging in the background."
+          - ""
+          - "Check cluster status:"
+          - "  export KUBECONFIG={{ ocp_install_dir }}/auth/kubeconfig"
+          - "  oc get nodes"
+          - "  oc get co"
+          - ""
+          - "Resume the monitor:"
+          - "  openshift-install agent wait-for install-complete --dir {{ ocp_install_dir }} --log-level=info"
+      when: (ic_result.rc | default(1)) != 0
+
+    - name: Fail if install-complete did not succeed
+      ansible.builtin.fail:
+        msg: >-
+          install-complete timed out after {{ install_timeout_minutes }} minutes.
+          KUBECONFIG and directory ownership have been fixed.
+          Run 'oc get co' to check operator status — the cluster may already be healthy.
+      when: (ic_result.rc | default(1)) != 0
