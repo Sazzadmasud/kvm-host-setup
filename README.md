@@ -18,7 +18,9 @@ Container Platform using the agent-based installation method.
    - [Load Balancer — HAProxy + VIPs](#load-balancer--haproxy--vips)
    - [NetworkManager DNS Forwarding](#networkmanager-dns-forwarding)
    - [Libvirt Network](#libvirt-network)
+   - [RHOSO Networks](#rhoso-networks)
    - [Redfish Emulator — sushy](#redfish-emulator--sushy)
+   - [WireGuard VPN](#wireguard-vpn)
    - [System Sleep Prevention](#system-sleep-prevention)
 6. [OCP Deployment](#ocp-deployment)
    - [Unattended (deploy.yml)](#unattended-deployyml)
@@ -55,7 +57,9 @@ ansible-playbook deploy.yml
 2. Agent ISO generation
 3. VM boot
 4. Wait for bootstrap-complete (~20 min)
-5. Wait for install-complete (~90 min)
+5. Wait for install-complete (~90–150 min on this hardware)
+
+Total time: **2.5–3 hours** from a clean host on the i7-10710U.
 
 **To wipe and reinstall:**
 
@@ -560,14 +564,42 @@ ansible-playbook eject-iso.yml
 ```
 
 Runs `openshift-install agent wait-for bootstrap-complete` (up to 90 min),
-then `wait-for install-complete` (up to 120 min). No ISO ejection is needed —
+then `wait-for install-complete` (up to 180 min). No ISO ejection is needed —
 after coreos-installer writes RHCOS, the disk's EFI bootloader takes over on
 every subsequent reboot automatically.
+
+If `install-complete` times out, the playbook still fixes kubeconfig ownership
+and prints manual resume instructions. The cluster continues converging in the
+background — check `oc get co` and `oc get nodes` before concluding it failed.
 
 While waiting, monitor operator status in another terminal:
 ```bash
 export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
 watch -n15 "oc get co | grep -v 'True.*False.*False'"
+```
+
+---
+
+## Post-Install Steps
+
+### Attach RHOSO NICs (if not using deploy.yml from scratch)
+
+If the cluster was installed before the RHOSO NIC template change, run the migration playbook to add the extra interfaces and cold-restart VMs one at a time:
+
+```bash
+ansible-playbook attach-osp-nics.yml
+```
+
+If you used `deploy.yml` on a clean host, all 3 NICs are already present — skip this.
+
+### WireGuard VPN
+
+Run once after the cluster is up:
+
+```bash
+ansible-playbook wireguard.yml
+scp <kvm-host>:/etc/wireguard/client.conf ~/wg-ocp-lab.conf
+# Import ~/wg-ocp-lab.conf into WireGuard app on macOS
 ```
 
 ---
@@ -614,7 +646,7 @@ All tunable values live in [group_vars/all.yml](group_vars/all.yml):
 |---|---|---|
 | `cluster_name` | `ocp` | OCP cluster name |
 | `base_domain` | `lab.local` | Base DNS domain |
-| `ocp_version` | `4.18` | Version for binary downloads |
+| `ocp_version` | `4.18` | Version for client binary downloads (note: `openshift-install` always pulls the latest stable installer — actual installed version may be newer, e.g. 4.21.7) |
 | `api_vip` | `192.168.200.10` | API load-balancer VIP |
 | `ingress_vip` | `192.168.200.11` | Ingress/router VIP |
 | `ocp_network_cidr` | `192.168.200.0/24` | Machine network |
@@ -923,8 +955,11 @@ console, ingress, monitoring are not available
 ```
 
 **Cause:** Operators that require workers (`ingress`, `monitoring`, `console`,
-`authentication`) are degraded if a worker is missing. The default 120-minute
-timeout may not be enough if workers join very late.
+`authentication`) are degraded if a worker is missing. The 180-minute
+timeout may not be enough on very slow hardware or if workers join very late.
+The updated `eject-iso.yml` always runs the ownership fixup and exports
+`KUBECONFIG` even when the timeout fires, so the cluster is still usable for
+manual monitoring.
 
 **Diagnose:**
 ```bash
@@ -1010,6 +1045,26 @@ Quick check:
 gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout
 # should be 0
 systemctl is-active suspend.target   # should be inactive (masked)
+```
+
+---
+
+### T18 — `permission denied` reading kubeconfig after install-complete timeout
+
+**Symptom:**
+```
+error loading config file "/opt/ocp/cluster/auth/kubeconfig": permission denied
+```
+
+**Cause:** In older versions of `eject-iso.yml`, the directory ownership fixup
+ran _after_ the install-complete check, so a timeout skipped it and
+`/opt/ocp/cluster/auth/kubeconfig` remained owned by root. Current version
+always runs the fixup. If you hit this on an existing deploy:
+
+```bash
+sudo chown -R sazzad:sazzad /opt/ocp/cluster
+export KUBECONFIG=/opt/ocp/cluster/auth/kubeconfig
+oc get nodes
 ```
 
 ---
