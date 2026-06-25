@@ -34,16 +34,16 @@ ocp_install_dir: "{{ ocp_base_dir }}/cluster"
 #  VM Defaults
 # ──────────────────────────────────────────────
 # Host: i7-10710U, 12 threads, 62GB RAM
-# Control total: 3 × 16 GB = 48 GB (overcommit is fine for lab)
-# Worker total:  2 × 8  GB = 16 GB
+# Control total: 3 × 14 GB = 42 GB
+# Worker total:  2 × 12 GB = 24 GB  (extra headroom for RHOSO workloads)
 # Host reserve:  ~2-3 GB
 
 control_vm_vcpus: 4
-control_vm_ram_mb: 16384
+control_vm_ram_mb: 14336
 control_vm_disk_gb: 120
 
 worker_vm_vcpus: 4
-worker_vm_ram_mb: 8192
+worker_vm_ram_mb: 12288
 worker_vm_disk_gb: 120
 
 # ──────────────────────────────────────────────
@@ -127,4 +127,4 @@ wireguard_subnet: 10.10.0.0/24
 # Set to your router's public IP if connecting from outside the LAN.
 # For LAN-only access, the host's local IP (192.168.1.154) is fine.
 # For internet access: set your router's public IP and forward UDP 51820 → 192.168.1.154.
-wireguard_server_endpoint: "192.168.1.154"
+wireguard_server_endpoint: "97.237.125.73"
