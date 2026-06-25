@@ -1,0 +1,52 @@
+# CirrOS test VM — containerDisk (EPHEMERAL, works TODAY, no StorageClass needed)
+# Disk is read-only from a registry image + a thin ephemeral overlay that is
+# DISCARDED when the VM stops. Perfect for a quick "does virt work?" smoke test.
+#
+# Apply:  oc apply -f cirros-vm-containerdisk.yaml
+# Start:  oc patch vm cirros-vm -n default --type merge -p '{"spec":{"runStrategy":"Always"}}'
+#   (or: virtctl start cirros-vm -n default)
+# Console (needs virtctl): virtctl console cirros-vm -n default
+# Login:  user "cirros"  password "gocubsgo"
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: cirros-vm
+  namespace: default
+spec:
+  runStrategy: Halted          # do NOT auto-start; you start it manually
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: cirros-vm
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        resources:
+          requests:
+            memory: 256Mi       # CirrOS is tiny; keep small given host RAM pressure
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}     # pod-network NAT; no extra network config needed
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/kubevirt/cirros-container-disk-demo:latest
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              password: gocubsgo
+              chpasswd: { expire: False }
+              ssh_pwauth: True

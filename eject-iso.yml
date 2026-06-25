@@ -93,6 +93,22 @@
       become: false
 
     # ──────────────────────────────────────────────
+    #  Compact 3C/W topology — make the control plane
+    #  schedulable so workloads (and CNV VMs) can use
+    #  control-node headroom instead of stranding it.
+    #  See docs/ARCHITECTURE.md.
+    # ──────────────────────────────────────────────
+    - name: Make control plane schedulable (3C/W compact design)
+      ansible.builtin.command: >
+        oc --kubeconfig {{ ocp_install_dir }}/auth/kubeconfig
+        patch schedulers.config.openshift.io cluster --type merge
+        -p '{"spec":{"mastersSchedulable":true}}'
+      register: masters_sched
+      changed_when: "'patched' in masters_sched.stdout"
+      failed_when: false
+      when: (ic_result.rc | default(1)) == 0
+
+    # ──────────────────────────────────────────────
     #  Report outcome
     # ──────────────────────────────────────────────
     - name: Installation complete

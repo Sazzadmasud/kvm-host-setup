@@ -1,0 +1,66 @@
+# CirrOS test VM — PERSISTENT disk via CDI DataVolume.
+# REQUIRES a StorageClass (cluster currently has NONE — set one up first; see README notes).
+#
+# This manifest imports the image directly from a URL using CDI (no virtctl needed).
+# If instead you want to use the LOCAL file you already downloaded
+# (/opt/kvm-host-setup/images/cirros-0.6.2-x86_64-disk.img), use virtctl image-upload
+# into a blank DataVolume instead of the http source below — see the outline.
+#
+# Apply:  oc apply -f cirros-vm-datavolume.yaml   (CDI imports the disk, then VM can start)
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: cirros-vm-persistent
+  namespace: default
+spec:
+  runStrategy: Halted
+  dataVolumeTemplates:
+    - metadata:
+        name: cirros-dv
+      spec:
+        storage:
+          resources:
+            requests:
+              storage: 2Gi
+          # storageClassName: <your-storage-class>   # uncomment once a StorageClass exists
+          accessModes:
+            - ReadWriteOnce
+        source:
+          http:
+            url: https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: cirros-vm-persistent
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        resources:
+          requests:
+            memory: 256Mi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: cirros-dv
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              password: gocubsgo
+              chpasswd: { expire: False }
+              ssh_pwauth: True
